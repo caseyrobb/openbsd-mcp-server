@@ -1,0 +1,4 @@
+/obsd-mcp
+*.test
+*.out
+/dist/
