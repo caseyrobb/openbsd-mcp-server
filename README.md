@@ -27,15 +27,22 @@ forced command, so the server itself never opens a socket.
 | Tool | What it returns |
 |---|---|
 | `system_overview` | `uname -a`, `uptime`, selected `kern.*`/`hw.*`/`vm.*` sysctl values, `df -h`, `vmstat` |
-| `network_summary` | `ifconfig` (redacted), `netstat -rn`, and `pfctl -s info` if enabled with `-pf-doas` |
+| `network_summary` | `ifconfig` (redacted), `netstat -rn` |
 | `config_read` | One allowlisted file from `/etc`, redacted. The allowed paths are listed in the tool's input schema. |
+| `pf_status` | **Opt-in** (`-enable pf`). One `pfctl -s` view: `info`, `rules`, `tables`, `memory`, `timeouts`, `interfaces`, `queues` |
+| `unbound_status` | **Opt-in** (`-enable unbound`). One `unbound-control` view: `status`, `stats` (`stats_noreset`), `forwards`, `stubs`, `local_zones`, `auth_zones`, `insecure` |
+| `bgp_status` | **Opt-in** (`-enable bgp`). One `bgpctl show` view: `summary`, `neighbors`, `nexthops`, `interfaces`, `rib_memory` |
 
 The `config_read` allowlist is `/etc/rc.conf.local`, `pf.conf`, `sysctl.conf`,
 `hosts`, `resolv.conf`, `myname`, `mygate`, `ntpd.conf`, `syslog.conf`,
 `fstab`, `httpd.conf`, `ssh/sshd_config` and `/etc/hostname.<if>`.
 
-All tools are annotated `readOnlyHint: true`. If one command fails, only that
-section reports an error and the rest of the result is still returned.
+All tools are annotated `readOnlyHint: true`. If one command fails in
+`system_overview` or `network_summary`, only that section reports an error and
+the rest of the result is still returned. The `*_status` tools take a single
+`view` from a fixed enum, run exactly one fixed command, and return its
+redacted output plus the command line that ran. Opt-in tools are registered
+only when their feature is enabled.
 
 ## Requirements
 
@@ -75,17 +82,37 @@ restrict,command="/usr/local/libexec/obsd-mcp" ssh-ed25519 AAAA... agent-key
 The user needs a real login shell, because sshd runs forced commands through
 `$SHELL -c`.
 
-### Optional: PF status
+### Optional: pf, unbound and bgpd
 
-`/dev/pf` is root-only, so `pfctl -s info` needs `doas`. Add this
-exact-arguments rule to `/etc/doas.conf`:
+These subsystems are off by default. Turn them on with `-enable` in the
+forced command, for example:
 
 ```
-permit nopass obsdmcp as root cmd /sbin/pfctl args -s info
+restrict,command="/usr/local/libexec/obsd-mcp -enable pf,unbound,bgp" ssh-ed25519 AAAA... agent-key
 ```
 
-Then change the forced command to `/usr/local/libexec/obsd-mcp -pf-doas`.
-Without the flag, `doas` is not unveiled and `pfctl` is never run.
+| Feature | Runs | Access | Host setup |
+|---|---|---|---|
+| `pf` | `/sbin/pfctl -s <view>` | `doas -n` (`/dev/pf` is 0600 root) | doas rules |
+| `unbound` | `/usr/sbin/unbound-control <verb>` | `doas -n` (the control socket allows reload, flush and stop, so the server user must not have it) | doas rules; unbound running with `remote-control` enabled (the default `/etc/unbound.conf` does this) |
+| `bgp` | `/usr/sbin/bgpctl -s /var/run/bgpd.rsock show <view>` | unprivileged, through bgpd's **restricted** socket, which only accepts `show` requests | add `socket "/var/run/bgpd.rsock" restricted` to `/etc/bgpd.conf`, then `doas bgpctl reload` |
+
+Generate the exact `doas.conf` rules from the server itself, so they always
+match what it runs:
+
+```sh
+/usr/local/libexec/obsd-mcp -enable pf,unbound -print-doas obsdmcp | doas tee -a /etc/doas.conf
+doas doas -C /etc/doas.conf    # syntax check
+```
+
+Each rule pins the full argument list, for example
+`permit nopass obsdmcp as root cmd /sbin/pfctl args -s rules`, so doas refuses
+any other arguments. `unbound`'s statistics view uses `stats_noreset`: plain
+`stats` resets the counters and is never run.
+
+`doas` and `bgpctl` are unveiled only when a feature that needs them is
+enabled. `pfctl` and `unbound-control` are never executable by the server
+directly, only through `doas`.
 
 ## Connect an MCP client
 
@@ -112,7 +139,8 @@ Or in a generic `mcpServers` JSON config:
 
 | Flag | Purpose |
 |---|---|
-| `-pf-doas` | Enable `pfctl -s info` via `doas -n` (requires the rule above) |
+| `-enable pf,unbound,bgp` | Enable the opt-in `*_status` tools (see above) |
+| `-print-doas USER` | Print the `doas.conf` rules USER needs for `-enable`, then exit |
 | `-print-policy` | Print the exact `unveil`/`pledge` calls and exit |
 | `-unsafe-dev` | Run without a sandbox on non-OpenBSD systems, for development only |
 
@@ -124,7 +152,9 @@ default. The server reports this clearly instead of failing silently.
 | Resource | Default | Readable? |
 |---|---|---|
 | sysctl values used, `ifconfig`, `netstat -rn`, `df`, `vmstat` | n/a | yes |
-| `pfctl` (`/dev/pf`) | 0600 root | only with `-pf-doas` |
+| `pfctl` (`/dev/pf`) | 0600 root | only with `-enable pf` + doas rules |
+| unbound control socket | 0660, full control | only with `-enable unbound` + doas rules |
+| bgpd restricted socket | 0666, show-only | with `-enable bgp`, once bgpd.conf creates it |
 | `/etc/pf.conf` | 0600 | no, unless you grant group read |
 | `/etc/hostname.*` | 0640 | no (may contain keys) |
 | `/etc/rc.conf.local`, `hosts`, `resolv.conf`, `sshd_config` | 0644 | yes |
@@ -146,6 +176,9 @@ of non-allowlisted binaries fail, and that writes, sockets and further
 
 ```sh
 go test ./internal/sandbox -run Sandbox -v    # on OpenBSD, as a non-root user
+
+# after host setup, also run every pf/unbound/bgp view inside the sandbox:
+OBSDMCP_TEST_FEATURES=pf,unbound,bgp go test ./internal/sandbox -run Sandbox -v
 ```
 
 ### Layout

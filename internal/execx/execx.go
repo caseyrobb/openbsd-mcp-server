@@ -36,7 +36,7 @@ type Runner interface {
 type Exec struct {
 	Timeout   time.Duration
 	MaxOutput int
-	// Enabled lists the opt-in commands (e.g. pf_info) the operator allowed.
+	// Enabled lists the opt-in features (pf, unbound, bgp) the operator allowed.
 	Enabled basecmd.Enabled
 }
 
@@ -96,7 +96,8 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 // is not unveiled, so this fails with ENOENT. Instead, sandbox.Apply
 // chdirs the server to "/" before unveiling, and children inherit that cwd.
 func newCmd(ctx context.Context, spec basecmd.Spec, max int) (*exec.Cmd, *BoundedBuffer, *BoundedBuffer) {
-	cmd := exec.CommandContext(ctx, spec.Path, spec.Args...)
+	prog, args := spec.Argv() // adds the "doas -n" wrapper for Doas specs
+	cmd := exec.CommandContext(ctx, prog, args...)
 	cmd.Env = fixedEnv
 	cmd.Stdin = nil
 	stdout := &BoundedBuffer{Max: max}

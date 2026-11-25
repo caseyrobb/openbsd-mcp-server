@@ -24,7 +24,8 @@ import (
 func main() {
 	printPolicy := flag.Bool("print-policy", false, "print the unveil/pledge policy and exit")
 	unsafeDev := flag.Bool("unsafe-dev", false, "allow running without pledge/unveil on non-OpenBSD (development only)")
-	pfDoas := flag.Bool("pf-doas", false, "enable pfctl -s info via 'doas -n' (requires an exact-args doas.conf rule)")
+	enable := flag.String("enable", "", "comma-separated opt-in features: pf, unbound, bgp")
+	printDoas := flag.String("print-doas", "", "print the doas.conf rules USER needs for -enable, then exit")
 	flag.Parse()
 
 	// MCP owns stdout; all diagnostics go to stderr.
@@ -39,9 +40,22 @@ func main() {
 		log.Fatal(err)
 	}
 
-	enabled := basecmd.Enabled{}
-	if *pfDoas {
-		enabled[basecmd.PfInfo] = true
+	enabled, err := basecmd.ParseFeatures(*enable)
+	if err != nil {
+		log.Fatalf("-enable: %v", err)
+	}
+	if *printDoas != "" {
+		rules, err := basecmd.DoasRules(*printDoas, enabled)
+		if err != nil {
+			log.Fatalf("-print-doas: %v", err)
+		}
+		if len(rules) == 0 {
+			fmt.Println("# no doas rules needed for the enabled features")
+		}
+		for _, r := range rules {
+			fmt.Println(r)
+		}
+		return
 	}
 
 	// Expands /etc/hostname.* now, while /etc is still listable.
@@ -64,9 +78,9 @@ func main() {
 
 	// Build everything that might need extra privileges *before* sandboxing.
 	server := mcpserver.New(mcpserver.Config{
-		Runner:    execx.Exec{Enabled: enabled},
-		PFEnabled: *pfDoas,
-		Conf:      conf,
+		Runner:   execx.Exec{Enabled: enabled},
+		Features: enabled,
+		Conf:     conf,
 	})
 
 	skipped, err := sandbox.Apply(policy)

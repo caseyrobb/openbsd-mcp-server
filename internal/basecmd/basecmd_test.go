@@ -1,6 +1,7 @@
 package basecmd
 
 import (
+	"slices"
 	"strings"
 	"testing"
 )
@@ -11,8 +12,10 @@ func TestRegistryValid(t *testing.T) {
 	}
 }
 
+var all = Enabled{FeaturePF: true, FeatureUnbound: true, FeatureBGP: true}
+
 func TestRegistryHasNoPortsPaths(t *testing.T) {
-	for _, b := range Binaries(Enabled{PfInfo: true}) {
+	for _, b := range Binaries(all) {
 		if strings.HasPrefix(b, "/usr/local") || strings.HasPrefix(b, "/usr/X11R6") {
 			t.Errorf("binary %q is outside base system", b)
 		}
@@ -47,8 +50,14 @@ func TestValidateSpecRejects(t *testing.T) {
 		{Path: "/etc/rc"},
 		{Path: "/bin/sh/"},
 		{Path: "/sbin/sysctl", Args: []string{"a\x00b"}},
-		{Path: "/usr/bin/doas", Args: []string{"-n", "/usr/local/bin/pftop"}},
-		{Path: "/usr/bin/doas", Args: []string{"-n", "/sbin/../usr/local/bin/x"}},
+		{Path: "/sbin/pfctl", Args: []string{"/usr/local/bin/pftop"}},
+		{Path: "/sbin/pfctl", Args: []string{"/sbin/../usr/local/bin/x"}},
+		{Path: "/usr/sbin/bgpctl", Args: []string{"-s", "/tmp/bgpd.sock"}},
+		{Path: "/usr/sbin/bgpctl", Args: []string{"-s", "/var/run/../tmp/x"}},
+		{Path: "/sbin/pfctl", Args: []string{"-s rules"}}, // would split in doas.conf
+		{Path: "/sbin/pfctl", Args: []string{""}},
+		{Path: "/usr/bin/doas", Args: []string{"-n", "/sbin/pfctl"}},
+		{Path: "/sbin/pfctl", Feature: "carp"},
 	}
 	for _, s := range bad {
 		if err := validateSpec(s); err == nil {
@@ -66,33 +75,174 @@ func TestSysctlArgsAreReadOnly(t *testing.T) {
 	}
 }
 
-func TestOptInRequiresEnable(t *testing.T) {
-	if _, err := Lookup(PfInfo, nil); err == nil {
-		t.Fatal("opt-in command ran without being enabled")
-	}
-	if _, err := Lookup(PfInfo, Enabled{PfInfo: true}); err != nil {
-		t.Fatal(err)
-	}
-	for _, b := range Binaries(nil) {
-		if b == "/usr/bin/doas" {
-			t.Fatal("doas unveiled without opt-in")
+func TestFeatureGating(t *testing.T) {
+	for id, s := range registry {
+		if s.Feature == "" {
+			continue
 		}
-	}
-	found := false
-	for _, b := range Binaries(Enabled{PfInfo: true}) {
-		found = found || b == "/usr/bin/doas"
-	}
-	if !found {
-		t.Fatal("doas missing when pf_info enabled")
+		if _, err := Lookup(id, nil); err == nil {
+			t.Errorf("%s ran without feature %s enabled", id, s.Feature)
+		}
+		if _, err := Lookup(id, Enabled{s.Feature: true}); err != nil {
+			t.Errorf("%s: %v", id, err)
+		}
+		// Enabling a different feature must not unlock it.
+		for _, f := range Features {
+			if f != s.Feature {
+				if _, err := Lookup(id, Enabled{f: true}); err == nil {
+					t.Errorf("%s unlocked by unrelated feature %s", id, f)
+				}
+			}
+		}
 	}
 }
 
-func TestPfInfoArgsExact(t *testing.T) {
-	// Must match the documented doas.conf rule exactly:
-	//   permit nopass obsdmcp as root cmd /sbin/pfctl args -s info
-	s, _ := Lookup(PfInfo, Enabled{PfInfo: true})
-	got := strings.Join(append([]string{s.Path}, s.Args...), " ")
-	if got != "/usr/bin/doas -n /sbin/pfctl -s info" {
-		t.Fatalf("pf_info argv = %q", got)
+func TestBinariesPerFeature(t *testing.T) {
+	cases := []struct {
+		en         Enabled
+		want, deny []string
+	}{
+		{nil, nil, []string{DoasPath, "/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/bgpctl"}},
+		{Enabled{FeaturePF: true}, []string{DoasPath}, []string{"/sbin/pfctl", "/usr/sbin/bgpctl"}},
+		{Enabled{FeatureUnbound: true}, []string{DoasPath}, []string{"/usr/sbin/unbound-control", "/usr/sbin/bgpctl"}},
+		{Enabled{FeatureBGP: true}, []string{"/usr/sbin/bgpctl"}, []string{DoasPath}},
+	}
+	for _, c := range cases {
+		got := Binaries(c.en)
+		for _, w := range c.want {
+			if !slices.Contains(got, w) {
+				t.Errorf("Binaries(%v) missing %s: %v", c.en, w, got)
+			}
+		}
+		for _, d := range c.deny {
+			if slices.Contains(got, d) {
+				t.Errorf("Binaries(%v) must not contain %s: %v", c.en, d, got)
+			}
+		}
+	}
+}
+
+func TestPfctlOnlyShows(t *testing.T) {
+	safe := map[string]bool{"info": true, "rules": true, "Tables": true, "memory": true,
+		"timeouts": true, "Interfaces": true, "queue": true}
+	for id, s := range registry {
+		if s.Path != "/sbin/pfctl" {
+			continue
+		}
+		if !s.Doas || s.Feature != FeaturePF {
+			t.Errorf("%s: pfctl must be doas + feature pf", id)
+		}
+		if len(s.Args) != 2 || s.Args[0] != "-s" || !safe[s.Args[1]] {
+			t.Errorf("%s: pfctl args %v are not a single safe -s modifier", id, s.Args)
+		}
+	}
+}
+
+func TestUnboundControlOnlyReadOnlyVerbs(t *testing.T) {
+	for id, s := range registry {
+		if s.Path != "/usr/sbin/unbound-control" {
+			continue
+		}
+		if !s.Doas || s.Feature != FeatureUnbound {
+			t.Errorf("%s: unbound-control must be doas + feature unbound", id)
+		}
+		if len(s.Args) != 1 {
+			t.Errorf("%s: want exactly one verb, got %v", id, s.Args)
+			continue
+		}
+		v := s.Args[0]
+		// "stats" resets counters; only stats_noreset is read-only.
+		if !(v == "status" || v == "stats_noreset" || strings.HasPrefix(v, "list_")) {
+			t.Errorf("%s: verb %q is not on the read-only allowlist", id, v)
+		}
+	}
+}
+
+func TestBgpctlOnlyShowOnRestrictedSocket(t *testing.T) {
+	for id, s := range registry {
+		if s.Path != "/usr/sbin/bgpctl" {
+			continue
+		}
+		if s.Doas || s.Feature != FeatureBGP {
+			t.Errorf("%s: bgpctl must run unprivileged under feature bgp", id)
+		}
+		if len(s.Args) < 4 || s.Args[0] != "-s" || s.Args[1] != BGPRestrictedSocket || s.Args[2] != "show" {
+			t.Errorf("%s: args %v must be -s %s show ...", id, s.Args, BGPRestrictedSocket)
+		}
+	}
+}
+
+func TestArgvAddsDoasWrapper(t *testing.T) {
+	s, _ := Lookup(PfInfo, Enabled{FeaturePF: true})
+	p, a := s.Argv()
+	if got := strings.Join(append([]string{p}, a...), " "); got != "/usr/bin/doas -n /sbin/pfctl -s info" {
+		t.Fatalf("argv = %q", got)
+	}
+	s, _ = Lookup(BGPSummary, Enabled{FeatureBGP: true})
+	if got := s.String(); got != "/usr/sbin/bgpctl -s /var/run/bgpd.rsock show summary" {
+		t.Fatalf("argv = %q", got)
+	}
+}
+
+func rules(t *testing.T, user string, en Enabled) []string {
+	t.Helper()
+	r, err := DoasRules(user, en)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func TestDoasRules(t *testing.T) {
+	pf := rules(t, "obsdmcp", Enabled{FeaturePF: true})
+	if !slices.Contains(pf, "permit nopass obsdmcp as root cmd /sbin/pfctl args -s info") {
+		t.Errorf("missing pf info rule: %v", pf)
+	}
+	for _, r := range pf {
+		if strings.Contains(r, "unbound") || strings.Contains(r, "bgpctl") {
+			t.Errorf("rule for a disabled feature: %s", r)
+		}
+	}
+	// Every doas command in the registry yields exactly one rule, and the
+	// rule's args equal the command's args (what doas will match).
+	everything := rules(t, "u", all)
+	n := 0
+	for _, s := range registry {
+		if s.Doas {
+			n++
+			want := "permit nopass u as root cmd " + s.Path + " args " + strings.Join(s.Args, " ")
+			if !slices.Contains(everything, want) {
+				t.Errorf("no rule %q", want)
+			}
+		}
+	}
+	if len(everything) != n {
+		t.Errorf("%d rules for %d doas commands", len(everything), n)
+	}
+	if len(rules(t, "u", Enabled{FeatureBGP: true})) != 0 {
+		t.Error("bgp must not need doas")
+	}
+}
+
+func TestDoasRulesRejectsBadUser(t *testing.T) {
+	for _, u := range []string{"", "root keepenv", "a\npermit nopass x", ":wheel", "Obsd", "-x", strings.Repeat("a", 40)} {
+		if _, err := DoasRules(u, all); err == nil {
+			t.Errorf("DoasRules(%q) accepted", u)
+		}
+	}
+}
+
+func TestParseFeatures(t *testing.T) {
+	en, err := ParseFeatures("pf, bgp,,")
+	if err != nil || !en[FeaturePF] || !en[FeatureBGP] || en[FeatureUnbound] {
+		t.Fatalf("got %v, %v", en, err)
+	}
+	if en, err := ParseFeatures(""); err != nil || len(en) != 0 {
+		t.Fatalf("empty: %v, %v", en, err)
+	}
+	for _, bad := range []string{"pf,ipsec", "PF", "all", "pf;unbound"} {
+		if _, err := ParseFeatures(bad); err == nil {
+			t.Errorf("ParseFeatures(%q) accepted", bad)
+		}
 	}
 }

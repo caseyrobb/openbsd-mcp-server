@@ -4,10 +4,12 @@ package mcpserver
 
 import (
 	"context"
+	"strings"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/collect"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/confread"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/execx"
@@ -32,8 +34,9 @@ type ConfigReader interface {
 // Config holds the dependencies for every tool.
 type Config struct {
 	Runner execx.Runner
-	// PFEnabled mirrors -pf-doas. The runner must also have pf_info enabled.
-	PFEnabled bool
+	// Features mirrors -enable. Each enabled feature registers its
+	// *_status tool; the runner must be built with the same set.
+	Features basecmd.Enabled
 	// Conf enables config_read. Leave nil (untyped) to omit the tool.
 	Conf ConfigReader
 }
@@ -72,11 +75,11 @@ func New(c Config) *mcp.Server {
 	mcp.AddTool(s, &mcp.Tool{
 		Name:  "network_summary",
 		Title: "OpenBSD network and PF summary",
-		Description: "Read-only network state: ifconfig (secrets redacted), netstat -rn, " +
-			"and pfctl -s info when the operator enabled it. Takes no arguments.",
+		Description: "Read-only network state: ifconfig (secrets redacted) and netstat -rn. " +
+			"Takes no arguments. PF state is in pf_status when enabled.",
 		Annotations: readOnly,
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, _ struct{}) (*mcp.CallToolResult, collect.NetworkSummary, error) {
-		out, err := collect.Network(ctx, c.Runner, c.PFEnabled)
+		out, err := collect.Network(ctx, c.Runner)
 		return nil, out, err
 	})
 
@@ -108,5 +111,52 @@ func New(c Config) *mcp.Server {
 		})
 	}
 
+	for _, sub := range collect.Subsystems {
+		if c.Features[sub.Feature] {
+			addStatusTool(s, c.Runner, sub)
+		}
+	}
+
 	return s
+}
+
+// statusTitles are the human titles for each subsystem tool.
+var statusTitles = map[string]string{
+	"pf":      "OpenBSD pf status (pfctl -s)",
+	"unbound": "OpenBSD unbound status (unbound-control)",
+	"bgp":     "OpenBSD bgpd status (bgpctl show)",
+}
+
+// StatusInput is the argument to every *_status tool.
+type StatusInput struct {
+	View string `json:"view"`
+}
+
+func addStatusTool(s *mcp.Server, r execx.Runner, sub collect.Subsystem) {
+	names := sub.ViewNames()
+	enum := make([]any, len(names))
+	var lines []string
+	for i, v := range sub.Views {
+		enum[i] = v.Name
+		lines = append(lines, "  "+v.Name+": "+v.Description)
+	}
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  sub.Name + "_status",
+		Title: statusTitles[sub.Name],
+		Description: "Read-only " + sub.Name + " state from one fixed base-system command; " +
+			"secret values are replaced by <redacted>. Views:\n" + strings.Join(lines, "\n"),
+		Annotations: readOnly,
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"view": {Type: "string", Enum: enum, Description: "which fixed view to show"},
+			},
+			Required:             []string{"view"},
+			AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+		},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in StatusInput) (*mcp.CallToolResult, collect.StatusResult, error) {
+		// The enum is a convenience; Status re-checks the view name.
+		out, err := collect.Status(ctx, r, sub, in.View)
+		return nil, out, err
+	})
 }

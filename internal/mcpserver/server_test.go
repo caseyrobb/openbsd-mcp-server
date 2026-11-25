@@ -147,7 +147,7 @@ func TestNetworkSummaryCall(t *testing.T) {
 	raw, _ := json.Marshal(res.StructuredContent)
 	var got collect.NetworkSummary
 	json.Unmarshal(raw, &got)
-	if got.PF.Error != collect.PFUnavailable || got.Interfaces.Output != "ifconfig output" {
+	if got.Interfaces.Output != "ifconfig output" || got.Routes.Output != "routes output" {
 		t.Errorf("got %+v", got)
 	}
 }
@@ -248,5 +248,127 @@ func TestConfigReadOmittedWithoutReader(t *testing.T) {
 		if tool.Name == "config_read" {
 			t.Fatal("config_read registered without a reader")
 		}
+	}
+}
+
+var allFeatures = basecmd.Enabled{basecmd.FeaturePF: true, basecmd.FeatureUnbound: true, basecmd.FeatureBGP: true}
+
+func toolNames(t *testing.T, cs *mcp.ClientSession) []string {
+	t.Helper()
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, tool := range res.Tools {
+		names = append(names, tool.Name)
+	}
+	return names
+}
+
+func TestStatusToolsOnlyWhenEnabled(t *testing.T) {
+	cs, _ := connectWith(t, Config{Runner: stubRunner{}})
+	for _, n := range toolNames(t, cs) {
+		if strings.HasSuffix(n, "_status") {
+			t.Errorf("%s registered with no features enabled", n)
+		}
+	}
+	cs, _ = connectWith(t, Config{Runner: stubRunner{}, Features: basecmd.Enabled{basecmd.FeatureBGP: true}})
+	names := toolNames(t, cs)
+	if !slices.Contains(names, "bgp_status") || slices.Contains(names, "pf_status") || slices.Contains(names, "unbound_status") {
+		t.Errorf("bgp only: tools = %v", names)
+	}
+}
+
+func TestStatusToolSchemaEnum(t *testing.T) {
+	cs, _ := connectWith(t, Config{Runner: stubRunner{}, Features: allFeatures})
+	res, err := cs.ListTools(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string][]string{
+		"pf_status":      collect.PF.ViewNames(),
+		"unbound_status": collect.Unbound.ViewNames(),
+		"bgp_status":     collect.BGP.ViewNames(),
+	}
+	for _, tool := range res.Tools {
+		w, ok := want[tool.Name]
+		if !ok {
+			continue
+		}
+		delete(want, tool.Name)
+		raw, _ := json.Marshal(tool.InputSchema)
+		var schema struct {
+			Properties struct {
+				View struct {
+					Enum []string `json:"enum"`
+				} `json:"view"`
+			} `json:"properties"`
+			Required []string `json:"required"`
+		}
+		json.Unmarshal(raw, &schema)
+		if !slices.Equal(schema.Properties.View.Enum, w) || !slices.Equal(schema.Required, []string{"view"}) {
+			t.Errorf("%s schema = %s", tool.Name, raw)
+		}
+		if a := tool.Annotations; a == nil || !a.ReadOnlyHint {
+			t.Errorf("%s not annotated read-only", tool.Name)
+		}
+	}
+	if len(want) != 0 {
+		t.Errorf("tools not registered: %v", want)
+	}
+}
+
+// recordingRunner records which command IDs ran.
+type recordingRunner struct{ ids []basecmd.ID }
+
+func (r *recordingRunner) Run(_ context.Context, id basecmd.ID) (execx.Result, error) {
+	r.ids = append(r.ids, id)
+	return execx.Result{Stdout: string(id) + " output\n"}, nil
+}
+
+func TestStatusToolCall(t *testing.T) {
+	rr := &recordingRunner{}
+	cs, _ := connectWith(t, Config{Runner: rr, Features: allFeatures})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{
+		Name: "unbound_status", Arguments: map[string]any{"view": "stats"},
+	})
+	if err != nil || res.IsError {
+		t.Fatalf("err=%v res=%s", err, callText(res))
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	var got collect.StatusResult
+	json.Unmarshal(raw, &got)
+	if got.Output != "unbound_stats output" || !strings.HasSuffix(got.Command, "stats_noreset") {
+		t.Errorf("got %+v", got)
+	}
+	if !slices.Equal(rr.ids, []basecmd.ID{basecmd.UnboundStats}) {
+		t.Errorf("ran %v", rr.ids)
+	}
+}
+
+func TestStatusToolRejectsBadViewBeforeRunning(t *testing.T) {
+	rr := &recordingRunner{}
+	cs, _ := connectWith(t, Config{Runner: rr, Features: allFeatures})
+	for _, c := range []struct {
+		tool string
+		args map[string]any
+	}{
+		{"pf_status", map[string]any{"view": "states"}},
+		{"pf_status", map[string]any{"view": "-F all"}},
+		{"unbound_status", map[string]any{"view": "reload"}},
+		{"unbound_status", map[string]any{"view": "flush_zone"}},
+		{"bgp_status", map[string]any{"view": "neighbor 192.0.2.1 down"}},
+		{"bgp_status", map[string]any{"view": 1}},
+		{"bgp_status", map[string]any{}},
+		{"pf_status", map[string]any{"view": "info", "extra": "x"}},
+	} {
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: c.tool, Arguments: c.args})
+		if err == nil && !res.IsError {
+			t.Errorf("%s %v accepted", c.tool, c.args)
+		}
+	}
+	if len(rr.ids) != 0 {
+		t.Errorf("commands ran for rejected input: %v", rr.ids)
 	}
 }

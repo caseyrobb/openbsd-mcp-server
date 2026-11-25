@@ -59,21 +59,56 @@ results are still returned. A cancelled context fails the whole call.
 |---|---|---|
 | ifconfig | `/sbin/ifconfig` | yes. Wireless/WireGuard keys are not shown to non-root. |
 | routes | `/usr/bin/netstat -rn` | yes (routing sysctl) |
-| pf_info | `/sbin/pfctl -s info` | **no**. `/dev/pf` is `crw------- root`. |
 
-For `pf_info`, the default is to return `"unavailable: requires root"` without
-running anything. With the opt-in `-pf-doas` flag, the server runs
-`/usr/bin/doas -n /sbin/pfctl -s info` with this exact-args rule:
+ifconfig output is passed through `redact` in case a key is ever shown.
+
+### Opt-in subsystems: `pf_status`, `unbound_status`, `bgp_status`
+
+Enabled with `-enable pf,unbound,bgp`. Each feature gates a group of registry
+entries (`basecmd.Spec.Feature`). A disabled feature's commands are refused by
+`basecmd.Lookup`, so by `execx` too. Its programs are not unveiled, and its
+tool is not registered. Each tool takes one `view` from a fixed enum
+(`collect.PF`, `collect.Unbound`, `collect.BGP`). Every view maps to exactly
+one registry ID, and its output is redacted.
+
+| Feature | Access path | Why |
+|---|---|---|
+| `pf` | `doas -n /sbin/pfctl -s <modifier>` | `/dev/pf` is 0600 root. |
+| `unbound` | `doas -n /usr/sbin/unbound-control <verb>` | The default `/etc/unbound.conf` enables `/var/run/unbound.sock`, which unbound chmods to 0660. That socket accepts **every** command (reload, flush, stop), so giving the server user socket access would allow changes. doas pins one read-only verb per rule instead. |
+| `bgp` | `/usr/sbin/bgpctl -s /var/run/bgpd.rsock show ...` (no doas) | `socket "path" restricted` in bgpd.conf makes bgpd create a 0666 socket. `control.c` accepts only `IMSG_CTL_SHOW_*` messages on it, so it is read-only in the daemon itself. |
+
+Registry tests enforce the read-only argument shape:
+
+* pfctl must be exactly `-s <modifier>`, from a fixed safe set.
+* unbound-control must be a single verb: `status`, `stats_noreset` or
+  `list_*`. Plain `stats` resets counters, and the test rejects it.
+* bgpctl must start with `-s /var/run/bgpd.rsock show`.
+* Arguments may not contain whitespace, so every argument stays one doas.conf
+  token.
+* An absolute-path argument must name a base program or a socket under
+  `/var/run`.
+
+`Spec.Path` is always the real program. `Spec.Doas` adds the
+`/usr/bin/doas -n` wrapper in `Spec.Argv()`, which is used both for exec and
+for `-print-doas`. So the doas rules the operator installs are generated
+from the same table the server runs:
 
 ```
-# /etc/doas.conf
+$ obsd-mcp -enable pf -print-doas obsdmcp
+permit nopass obsdmcp as root cmd /sbin/pfctl args -s Interfaces
+permit nopass obsdmcp as root cmd /sbin/pfctl args -s Tables
 permit nopass obsdmcp as root cmd /sbin/pfctl args -s info
+...
 ```
 
-`args` with a fixed list means doas rejects any other arguments. `/usr/bin/doas`
-is unveiled `x` only when the flag is set. Without the flag, `pf_info` is also
-refused by `basecmd.Lookup` and `execx`. ifconfig output is passed through
-`redact` in case a key is ever shown.
+`args` with a fixed list means doas rejects any other arguments. If a
+command fails, the tool returns an error with the first stderr line
+(redacted) and a setup hint.
+
+The children still run outside our sandbox. `unveil` is not inherited across
+`execve`, and doas is setuid. The safety argument for these features is
+therefore the fixed argv, the exact-args doas rules, and, for bgpd, the
+daemon-enforced restricted socket. It is not our pledge.
 
 ### `config_read`
 
@@ -132,8 +167,8 @@ Order in `main`: validate registry → build policy → build server →
 **unveil each rule → `unveil(NULL, NULL)` → `pledge(promises, NULL)`** → read
 the first byte of stdin.
 
-Current policy (`obsd-mcp -print-policy -pf-doas`; without `-pf-doas` the
-doas line is absent):
+Current policy (`obsd-mcp -enable pf,unbound,bgp -print-policy`; the doas line
+appears only with `pf` or `unbound`, and the bgpctl line only with `bgp`):
 
 ```c
 unveil("/bin/df", "x");
@@ -153,11 +188,12 @@ unveil("/etc/syslog.conf", "r");
                                     /* + /etc/hostname.<if> present at startup */
 unveil("/sbin/ifconfig", "x");
 unveil("/sbin/sysctl", "x");
-unveil("/usr/bin/doas", "x");       /* only with -pf-doas */
+unveil("/usr/bin/doas", "x");       /* only with -enable pf or unbound */
 unveil("/usr/bin/netstat", "x");
 unveil("/usr/bin/uname", "x");
 unveil("/usr/bin/uptime", "x");
 unveil("/usr/bin/vmstat", "x");
+unveil("/usr/sbin/bgpctl", "x");    /* only with -enable bgp */
 unveil(NULL, NULL);
 pledge("stdio rpath proc exec", NULL);
 ```
@@ -250,10 +286,17 @@ the production policy and then probes it:
 
 * **allowed**: `confread.Read` of `/etc/hosts` and `/etc/ssh/sshd_config`
   succeeds, every non-opt-in command (`sysctl uname uptime df vmstat
-  ifconfig netstat`) runs through the real runner, and `pf_info` is refused
-  without opt-in. Opening `master.passwd`, `spwd.db`, `passwd`, `doas.conf`,
-  ssh host keys, `/usr/local`, `/etc/rc` and `/var/log/messages` fails.
-  Listing `/etc` fails. Executing `sh`, `ksh`, `doas`, `pfctl` and `cat` fails.
+  ifconfig netstat`) runs through the real runner, and `pf_info`,
+  `unbound_status` and `bgp_summary` are refused with no features enabled.
+  Opening `master.passwd`, `spwd.db`, `passwd`, `doas.conf`, ssh host keys,
+  `/usr/local`, `/etc/rc` and `/var/log/messages` fails. Listing `/etc` fails.
+  Executing `sh`, `ksh`, `doas`, `pfctl`, `cat`, `unbound-control` and
+  `bgpctl` fails.
+* **features** (only with `OBSDMCP_TEST_FEATURES=pf,unbound,bgp`, after host
+  setup): applies the policy for those features, runs **every view** of each
+  enabled subsystem through the real runner and collector, and checks that
+  `pfctl` and `unbound-control` still cannot be executed directly, only
+  through doas.
 * **write / devnull-write / socket / unveil**: creating a file, opening
   `/dev/null` for writing, opening a TCP socket, or calling `unveil` again
   must kill the child with SIGABRT (pledge violation) or fail cleanly.

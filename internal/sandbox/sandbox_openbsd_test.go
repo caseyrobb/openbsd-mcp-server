@@ -22,11 +22,18 @@ import (
 	"golang.org/x/sys/unix"
 
 	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
+	"github.com/caseyrobb/openbsd-mcp-server/internal/collect"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/confread"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/execx"
 )
 
-const childEnv = "OBSDMCP_SANDBOX_CHILD"
+const (
+	childEnv = "OBSDMCP_SANDBOX_CHILD"
+	// featuresEnv opts in to TestSandboxFeatures, e.g. "pf,unbound,bgp".
+	// The host must be set up first: doas rules from -print-doas, unbound
+	// running, bgpd running with the restricted socket.
+	featuresEnv = "OBSDMCP_TEST_FEATURES"
+)
 
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(childEnv); mode != "" {
@@ -43,7 +50,14 @@ func child(mode string) int {
 		fmt.Println("setup: confread:", err)
 		return 2
 	}
-	p, err := NewPolicy(basecmd.Binaries(nil), conf.Paths())
+	en := basecmd.Enabled{}
+	if mode == "features" {
+		if en, err = basecmd.ParseFeatures(os.Getenv(featuresEnv)); err != nil {
+			fmt.Println("setup:", err)
+			return 2
+		}
+	}
+	p, err := NewPolicy(basecmd.Binaries(en), conf.Paths())
 	if err != nil {
 		fmt.Println("setup: policy:", err)
 		return 2
@@ -56,6 +70,8 @@ func child(mode string) int {
 	switch mode {
 	case "allowed":
 		return probeAllowed(conf)
+	case "features":
+		return probeFeatures(en)
 	case "write":
 		err := os.WriteFile("/tmp/obsdmcp-sandbox-probe", []byte("x"), 0o600)
 		fmt.Println("write returned:", err) // reached only if not killed
@@ -129,10 +145,12 @@ func probeAllowed(conf *confread.Reader) int {
 			fail("exec %s: empty output", id)
 		}
 	}
-	// Opt-in commands stay refused when not enabled.
-	step("execx pf_info (not enabled)")
-	if _, err := (execx.Exec{}).Run(context.Background(), basecmd.PfInfo); err == nil {
-		fail("pf_info ran without opt-in")
+	// Opt-in commands stay refused when their feature is not enabled.
+	for _, id := range []basecmd.ID{basecmd.PfInfo, basecmd.UnboundStatus, basecmd.BGPSummary} {
+		step("execx %s (not enabled)", id)
+		if _, err := (execx.Exec{}).Run(context.Background(), id); err == nil {
+			fail("%s ran without its feature enabled", id)
+		}
 	}
 
 	// Denied reads: not unveiled, so ENOENT/EACCES regardless of file mode.
@@ -156,7 +174,8 @@ func probeAllowed(conf *confread.Reader) int {
 	// Denied exec: anything not in the registry, including doas when
 	// pf_info is not opted in. Stdout/Stderr must be set, as in execx: a nil
 	// writer makes os/exec open /dev/null O_WRONLY, which needs "wpath".
-	for _, bin := range []string{"/bin/sh", "/bin/ksh", "/usr/bin/doas", "/sbin/pfctl", "/bin/cat"} {
+	for _, bin := range []string{"/bin/sh", "/bin/ksh", "/usr/bin/doas", "/sbin/pfctl", "/bin/cat",
+		"/usr/sbin/unbound-control", "/usr/sbin/bgpctl"} {
 		step("exec %s", bin)
 		var out bytes.Buffer
 		cmd := exec.Command(bin)
@@ -174,6 +193,43 @@ func probeAllowed(conf *confread.Reader) int {
 	return 0
 }
 
+// probeFeatures runs every view of every enabled subsystem through the real
+// runner and collector, inside the sandbox built for those features. The
+// targets (pfctl, unbound-control) must NOT be directly executable: only
+// doas is unveiled for them.
+func probeFeatures(en basecmd.Enabled) int {
+	var fails []string
+	r := execx.Exec{Enabled: en}
+	for _, sub := range collect.Subsystems {
+		if !en[sub.Feature] {
+			continue
+		}
+		for _, v := range sub.Views {
+			step("%s_status %s", sub.Name, v.Name)
+			// Empty output is valid (no queues, no tables, no forwards);
+			// only a failed command counts.
+			if _, err := collect.Status(context.Background(), r, sub, v.Name); err != nil {
+				fails = append(fails, fmt.Sprintf("%s/%s: %v", sub.Name, v.Name, err))
+			}
+		}
+	}
+	for _, bin := range []string{"/sbin/pfctl", "/usr/sbin/unbound-control"} {
+		step("direct exec %s", bin)
+		var out bytes.Buffer
+		cmd := exec.Command(bin)
+		cmd.Stdout, cmd.Stderr = &out, &out
+		if err := cmd.Run(); err == nil {
+			fails = append(fails, "direct exec of "+bin+" succeeded")
+		}
+	}
+	step("done")
+	if len(fails) > 0 {
+		fmt.Println(strings.Join(fails, "\n"))
+		return 1
+	}
+	return 0
+}
+
 func runChild(t *testing.T, mode string) (out string, ws syscall.WaitStatus) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^$")
@@ -184,6 +240,22 @@ func runChild(t *testing.T, mode string) (out string, ws syscall.WaitStatus) {
 		t.Fatalf("starting child: %v", err)
 	}
 	return string(b), cmd.ProcessState.Sys().(syscall.WaitStatus)
+}
+
+// TestSandboxFeatures runs only when OBSDMCP_TEST_FEATURES is set, because it
+// needs host setup (doas rules, running daemons).
+func TestSandboxFeatures(t *testing.T) {
+	if os.Getenv(featuresEnv) == "" {
+		t.Skip("set " + featuresEnv + "=pf,unbound,bgp (after host setup) to run")
+	}
+	out, ws := runChild(t, "features")
+	if ws.Signaled() {
+		t.Fatalf("child killed by %v\n%s", ws.Signal(), out)
+	}
+	if ws.ExitStatus() != 0 {
+		t.Fatalf("exit %d:\n%s", ws.ExitStatus(), out)
+	}
+	t.Logf("\n%s", out)
 }
 
 func TestSandboxAllowsOnlyPolicy(t *testing.T) {

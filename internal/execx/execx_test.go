@@ -45,6 +45,17 @@ func TestRunRejectsUnregistered(t *testing.T) {
 	}
 }
 
+func TestNewCmdWrapsDoas(t *testing.T) {
+	spec, err := basecmd.Lookup(basecmd.PfRules, basecmd.Enabled{basecmd.FeaturePF: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, _ := newCmd(context.Background(), spec, 16)
+	if got := strings.Join(cmd.Args, " "); cmd.Path != "/usr/bin/doas" || got != "/usr/bin/doas -n /sbin/pfctl -s rules" {
+		t.Fatalf("path=%q args=%q", cmd.Path, got)
+	}
+}
+
 func TestRunRejectsOptInNotEnabled(t *testing.T) {
 	_, err := Exec{}.Run(context.Background(), basecmd.PfInfo)
 	if err == nil || !strings.Contains(err.Error(), "not enabled") {
