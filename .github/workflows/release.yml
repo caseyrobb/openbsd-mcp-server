@@ -113,8 +113,12 @@ jobs:
         shell: cpa.sh {0} --sync-files none
         run: |
           set -e
-          feats=pf,services,confcheck
+          feats=pf,confcheck
           if pgrep -qx ntpd; then feats=$feats,ntp; fi
+          # rcctl ls started|failed run an rc.d check per service and take
+          # over 30s on the emulated (non-KVM) arm64 VM. rcctl is a ksh
+          # script, so the amd64 job covers it for both architectures.
+          if [ "$(arch -s)" = amd64 ]; then feats=$feats,services; fi
           bin=$PWD/dist/${{ matrix.goarch }}
           "$bin/obsd-mcp" -enable "$feats" -print-doas "$(id -un)" | sudo tee -a /etc/doas.conf
           sudo chown root:wheel /etc/doas.conf
