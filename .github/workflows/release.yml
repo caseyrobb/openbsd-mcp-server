@@ -109,6 +109,20 @@ jobs:
           ./dist/${{ matrix.goarch }}/obsd-mcp -version
           sh scripts/vmtest.sh dist/${{ matrix.goarch }}
 
+      - name: Test opt-in features through doas (generated rules)
+        shell: cpa.sh {0} --sync-files none
+        run: |
+          set -e
+          feats=pf,services,confcheck
+          if pgrep -qx ntpd; then feats=$feats,ntp; fi
+          bin=$PWD/dist/${{ matrix.goarch }}
+          "$bin/obsd-mcp" -enable "$feats" -print-doas "$(id -un)" | sudo tee -a /etc/doas.conf
+          sudo chown root:wheel /etc/doas.conf
+          sudo chmod 0600 /etc/doas.conf
+          sudo doas -C /etc/doas.conf
+          cd internal/sandbox
+          OBSDMCP_TEST_FEATURES=$feats "$bin/tests/sandbox.test" -test.run SandboxFeatures -test.v
+
       - name: Build package with pkg_create
         shell: cpa.sh {0} --sync-files vm-to-runner --environment-variables PKG_VERSION
         run: sh scripts/mkpkg.sh "$PKG_VERSION" dist/${{ matrix.goarch }}/obsd-mcp dist/pkg

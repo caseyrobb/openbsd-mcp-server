@@ -2,9 +2,11 @@ package execx
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
 )
@@ -107,5 +109,47 @@ func TestFixedEnvHasNoInheritedVars(t *testing.T) {
 	}
 	if strings.Contains(fixedEnv[0], "/usr/local") {
 		t.Error("PATH must not include /usr/local")
+	}
+}
+
+func TestLimiterCapsConcurrency(t *testing.T) {
+	l := NewLimiter(2, 20*time.Millisecond)
+	ctx := context.Background()
+	if err := l.acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.acquire(ctx); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err := l.acquire(ctx)
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("third acquire: %v, want ErrBusy", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("busy wait not bounded")
+	}
+	l.release()
+	if err := l.acquire(ctx); err != nil {
+		t.Fatalf("after release: %v", err)
+	}
+}
+
+func TestLimiterHonoursCancel(t *testing.T) {
+	l := NewLimiter(1, time.Minute)
+	_ = l.acquire(context.Background())
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := l.acquire(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestRunBusyDoesNotExec(t *testing.T) {
+	l := NewLimiter(1, 10*time.Millisecond)
+	_ = l.acquire(context.Background()) // hold the only slot
+	_, err := Exec{Limit: l}.Run(context.Background(), basecmd.Uname)
+	if !errors.Is(err, ErrBusy) {
+		t.Fatalf("err = %v, want ErrBusy", err)
 	}
 }

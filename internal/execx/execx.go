@@ -16,7 +16,45 @@ import (
 const (
 	DefaultTimeout   = 5 * time.Second
 	DefaultMaxOutput = 256 << 10 // 256 KiB per stream
+	// DefaultConcurrency caps child processes running at once, so a
+	// misbehaving client cannot fork-storm the host.
+	DefaultConcurrency = 4
+	// DefaultQueueWait is how long a call waits for a free slot.
+	DefaultQueueWait = 2 * time.Second
 )
+
+// ErrBusy is returned when no command slot frees up within the queue wait.
+var ErrBusy = errors.New("too many commands running; retry shortly")
+
+// Limiter caps how many commands run at once. It is shared by every Run on
+// the same Exec value, so it must be a pointer.
+type Limiter struct {
+	slots chan struct{}
+	wait  time.Duration
+}
+
+// NewLimiter allows n concurrent commands; callers wait up to wait for a slot.
+func NewLimiter(n int, wait time.Duration) *Limiter {
+	if n < 1 {
+		n = 1
+	}
+	return &Limiter{slots: make(chan struct{}, n), wait: wait}
+}
+
+func (l *Limiter) acquire(ctx context.Context) error {
+	t := time.NewTimer(l.wait)
+	defer t.Stop()
+	select {
+	case l.slots <- struct{}{}:
+		return nil
+	case <-t.C:
+		return fmt.Errorf("%w (limit %d)", ErrBusy, cap(l.slots))
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (l *Limiter) release() { <-l.slots }
 
 // Result is the outcome of one command run.
 type Result struct {
@@ -36,8 +74,10 @@ type Runner interface {
 type Exec struct {
 	Timeout   time.Duration
 	MaxOutput int
-	// Enabled lists the opt-in features (pf, unbound, bgp) the operator allowed.
+	// Enabled lists the opt-in features the operator allowed.
 	Enabled basecmd.Enabled
+	// Limit caps concurrent commands; nil means unlimited (tests only).
+	Limit *Limiter
 }
 
 // fixedEnv is the entire environment children see. No inherited variables.
@@ -58,6 +98,13 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 	if max <= 0 {
 		max = DefaultMaxOutput
 	}
+	if e.Limit != nil {
+		if err := e.Limit.acquire(ctx); err != nil {
+			return Result{}, fmt.Errorf("%s: %w", id, err)
+		}
+		defer e.Limit.release()
+	}
+	// The timeout starts once a slot is held: it bounds the command only.
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 

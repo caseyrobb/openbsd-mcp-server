@@ -9,6 +9,7 @@ import (
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/caseyrobb/openbsd-mcp-server/internal/audit"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/collect"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/confread"
@@ -42,6 +43,8 @@ type Config struct {
 	Features basecmd.Enabled
 	// Conf enables config_read. Leave nil (untyped) to omit the tool.
 	Conf ConfigReader
+	// Audit, if set, receives one line per initialize and tools/call.
+	Audit audit.Logger
 }
 
 func ptr[T any](v T) *T { return &v }
@@ -63,6 +66,9 @@ type ConfigReadInput struct {
 // New builds the MCP server with all tools registered.
 func New(c Config) *mcp.Server {
 	s := mcp.NewServer(&mcp.Implementation{Name: Name, Version: Version}, nil)
+	if c.Audit != nil {
+		s.AddReceivingMiddleware(auditMiddleware(c.Audit))
+	}
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name:  "system_overview",
@@ -115,9 +121,13 @@ func New(c Config) *mcp.Server {
 	}
 
 	for _, sub := range collect.Subsystems {
-		if c.Features[sub.Feature] {
+		if sub.Feature == "" || c.Features[sub.Feature] {
 			addStatusTool(s, c.Runner, sub)
 		}
+	}
+
+	if c.Features[basecmd.FeatureConfCheck] {
+		addConfigCheckTool(s, c.Runner)
 	}
 
 	return s
@@ -125,9 +135,13 @@ func New(c Config) *mcp.Server {
 
 // statusTitles are the human titles for each subsystem tool.
 var statusTitles = map[string]string{
-	"pf":      "OpenBSD pf status (pfctl -s)",
-	"unbound": "OpenBSD unbound status (unbound-control)",
-	"bgp":     "OpenBSD bgpd status (bgpctl show)",
+	"system":   "OpenBSD sensors, mounts, swap and processes",
+	"network":  "OpenBSD network statistics, sockets and neighbors",
+	"pf":       "OpenBSD pf status (pfctl -s)",
+	"unbound":  "OpenBSD unbound status (unbound-control)",
+	"bgp":      "OpenBSD bgpd status (bgpctl show)",
+	"ntp":      "OpenBSD ntpd status (ntpctl -s)",
+	"services": "OpenBSD rc.d service status (rcctl ls)",
 }
 
 // StatusInput is the argument to every *_status tool.
@@ -160,6 +174,41 @@ func addStatusTool(s *mcp.Server, r execx.Runner, sub collect.Subsystem) {
 	}, func(ctx context.Context, _ *mcp.CallToolRequest, in StatusInput) (*mcp.CallToolResult, collect.StatusResult, error) {
 		// The enum is a convenience; Status re-checks the view name.
 		out, err := collect.Status(ctx, r, sub, in.View)
+		return nil, out, err
+	})
+}
+
+// ConfigCheckInput is the argument to config_check.
+type ConfigCheckInput struct {
+	Daemon string `json:"daemon"`
+}
+
+func addConfigCheckTool(s *mcp.Server, r execx.Runner) {
+	sub := collect.ConfigChecks
+	enum := make([]any, len(sub.Views))
+	var lines []string
+	for i, v := range sub.Views {
+		enum[i] = v.Name
+		lines = append(lines, "  "+v.Name+": "+v.Description)
+	}
+	mcp.AddTool(s, &mcp.Tool{
+		Name:  "config_check",
+		Title: "Validate a base daemon's configuration (configtest mode)",
+		Description: "Runs one daemon's documented check-only mode (-n, or sshd -t) and reports whether " +
+			"its configuration is valid, with the checker's messages. Nothing is loaded or reloaded. " +
+			"valid=false with output is a normal answer (syntax error, or the config file does not exist). Daemons:\n" +
+			strings.Join(lines, "\n"),
+		Annotations: readOnly,
+		InputSchema: &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"daemon": {Type: "string", Enum: enum, Description: "which daemon's configuration to check"},
+			},
+			Required:             []string{"daemon"},
+			AdditionalProperties: &jsonschema.Schema{Not: &jsonschema.Schema{}},
+		},
+	}, func(ctx context.Context, _ *mcp.CallToolRequest, in ConfigCheckInput) (*mcp.CallToolResult, collect.ConfigCheckResult, error) {
+		out, err := collect.ConfigCheck(ctx, r, in.Daemon)
 		return nil, out, err
 	})
 }

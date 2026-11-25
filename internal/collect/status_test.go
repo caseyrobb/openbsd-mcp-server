@@ -12,8 +12,11 @@ import (
 )
 
 func TestSubsystemTablesMatchRegistry(t *testing.T) {
-	all := basecmd.Enabled{basecmd.FeaturePF: true, basecmd.FeatureUnbound: true, basecmd.FeatureBGP: true}
-	for _, s := range Subsystems {
+	all := basecmd.Enabled{}
+	for _, f := range basecmd.Features {
+		all[f] = true
+	}
+	for _, s := range append(Subsystems, ConfigChecks) {
 		seen := map[string]bool{}
 		for _, v := range s.Views {
 			if seen[v.Name] {
@@ -29,7 +32,7 @@ func TestSubsystemTablesMatchRegistry(t *testing.T) {
 			if spec.Feature != s.Feature {
 				t.Errorf("%s/%s runs %s (feature %q)", s.Name, v.Name, v.ID, spec.Feature)
 			}
-			if _, err := basecmd.Lookup(v.ID, nil); err == nil {
+			if _, err := basecmd.Lookup(v.ID, nil); err == nil && s.Feature != "" {
 				t.Errorf("%s/%s is runnable with no features enabled", s.Name, v.Name)
 			}
 		}
@@ -99,5 +102,45 @@ func TestStatusCancelled(t *testing.T) {
 	cancel()
 	if _, err := Status(ctx, &fakeRunner{}, PF, "info"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestAlwaysOnSubsystemsNeedNoFeatures(t *testing.T) {
+	for _, s := range []Subsystem{SystemViews, NetworkViews} {
+		if s.Feature != "" {
+			t.Errorf("%s must be always available", s.Name)
+		}
+		for _, v := range s.Views {
+			if _, err := basecmd.Lookup(v.ID, nil); err != nil {
+				t.Errorf("%s/%s: %v", s.Name, v.Name, err)
+			}
+		}
+	}
+}
+
+func TestStatusFailureWithoutHint(t *testing.T) {
+	f := &errRunner{res: execx.Result{Stderr: "netstat: kvm_openfiles: Permission denied\n"},
+		err: nonZero(basecmd.NetMbufs)}
+	_, err := Status(context.Background(), f, NetworkViews, "mbufs")
+	if err == nil || strings.Contains(err.Error(), "hint") || !strings.Contains(err.Error(), "Permission denied") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestStatusNonZeroOKIsAResult(t *testing.T) {
+	f := &errRunner{res: execx.Result{Stdout: "smtpd\n", ExitCode: 1}, err: nonZero(basecmd.SvcFailed)}
+	got, err := Status(context.Background(), f, Services, "failed")
+	if err != nil || got.Output != "smtpd" || got.ExitStatus != 1 {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	// ...but a doas refusal is still an error.
+	f = &errRunner{res: execx.Result{Stderr: "doas: Operation not permitted\n", ExitCode: 1}, err: nonZero(basecmd.SvcFailed)}
+	if _, err := Status(context.Background(), f, Services, "failed"); err == nil {
+		t.Fatal("doas refusal accepted")
+	}
+	// Views without NonZeroOK keep failing on non-zero exit.
+	f = &errRunner{res: execx.Result{Stdout: "x\n", ExitCode: 1}, err: nonZero(basecmd.SvcStarted)}
+	if _, err := Status(context.Background(), f, Services, "started"); err == nil {
+		t.Fatal("non-zero exit accepted for started")
 	}
 }

@@ -251,7 +251,13 @@ func TestConfigReadOmittedWithoutReader(t *testing.T) {
 	}
 }
 
-var allFeatures = basecmd.Enabled{basecmd.FeaturePF: true, basecmd.FeatureUnbound: true, basecmd.FeatureBGP: true}
+var allFeatures = func() basecmd.Enabled {
+	en := basecmd.Enabled{}
+	for _, f := range basecmd.Features {
+		en[f] = true
+	}
+	return en
+}()
 
 func toolNames(t *testing.T, cs *mcp.ClientSession) []string {
 	t.Helper()
@@ -268,13 +274,22 @@ func toolNames(t *testing.T, cs *mcp.ClientSession) []string {
 
 func TestStatusToolsOnlyWhenEnabled(t *testing.T) {
 	cs, _ := connectWith(t, Config{Runner: stubRunner{}})
-	for _, n := range toolNames(t, cs) {
-		if strings.HasSuffix(n, "_status") {
+	names := toolNames(t, cs)
+	for _, n := range names {
+		if strings.HasSuffix(n, "_status") && n != "system_status" && n != "network_status" {
 			t.Errorf("%s registered with no features enabled", n)
+		}
+		if n == "config_check" {
+			t.Error("config_check registered without confcheck")
+		}
+	}
+	for _, n := range []string{"system_status", "network_status"} {
+		if !slices.Contains(names, n) {
+			t.Errorf("always-available %s missing: %v", n, names)
 		}
 	}
 	cs, _ = connectWith(t, Config{Runner: stubRunner{}, Features: basecmd.Enabled{basecmd.FeatureBGP: true}})
-	names := toolNames(t, cs)
+	names = toolNames(t, cs)
 	if !slices.Contains(names, "bgp_status") || slices.Contains(names, "pf_status") || slices.Contains(names, "unbound_status") {
 		t.Errorf("bgp only: tools = %v", names)
 	}
@@ -287,9 +302,13 @@ func TestStatusToolSchemaEnum(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := map[string][]string{
-		"pf_status":      collect.PF.ViewNames(),
-		"unbound_status": collect.Unbound.ViewNames(),
-		"bgp_status":     collect.BGP.ViewNames(),
+		"pf_status":       collect.PF.ViewNames(),
+		"unbound_status":  collect.Unbound.ViewNames(),
+		"bgp_status":      collect.BGP.ViewNames(),
+		"system_status":   collect.SystemViews.ViewNames(),
+		"network_status":  collect.NetworkViews.ViewNames(),
+		"ntp_status":      collect.NTP.ViewNames(),
+		"services_status": collect.Services.ViewNames(),
 	}
 	for _, tool := range res.Tools {
 		w, ok := want[tool.Name]

@@ -27,10 +27,19 @@ const (
 	FeaturePF      Feature = "pf"      // pfctl via doas (/dev/pf is 0600 root)
 	FeatureUnbound Feature = "unbound" // unbound-control via doas (socket is full-control)
 	FeatureBGP     Feature = "bgp"     // bgpctl via bgpd's restricted (show-only) socket
+	FeatureNTP     Feature = "ntp"     // ntpctl via doas (ntpd's socket is 0660 root)
+	// FeatureServices runs rcctl(8) via doas. rcctl is a ksh script, so
+	// running it directly would need /bin/ksh unveiled "x"; through doas,
+	// doas execs it after our unveil is gone. "ls started|failed" also
+	// need root.
+	FeatureServices Feature = "services"
+	// FeatureConfCheck runs each daemon's configtest mode (-n, sshd -t)
+	// via doas, because the configs are mostly 0600 root.
+	FeatureConfCheck Feature = "confcheck"
 )
 
 // Features lists every opt-in feature in display order.
-var Features = []Feature{FeaturePF, FeatureUnbound, FeatureBGP}
+var Features = []Feature{FeaturePF, FeatureUnbound, FeatureBGP, FeatureNTP, FeatureServices, FeatureConfCheck}
 
 // DoasPath is the only privilege wrapper the server may run.
 const DoasPath = "/usr/bin/doas"
@@ -72,6 +81,44 @@ const (
 	BGPNexthops   ID = "bgp_nexthops"
 	BGPInterfaces ID = "bgp_interfaces"
 	BGPRIBMemory  ID = "bgp_rib_memory"
+
+	Sensors   ID = "sensors"
+	Mounts    ID = "mounts"
+	Swap      ID = "swap"
+	ProcsCPU  ID = "procs_cpu"
+	ProcsMem  ID = "procs_mem"
+	NetProto  ID = "net_protocols"
+	NetIfaces ID = "net_interfaces"
+	NetMbufs  ID = "net_mbufs"
+	NetSock4  ID = "net_sockets_inet"
+	NetSock6  ID = "net_sockets_inet6"
+	NetARP    ID = "net_arp"
+	NetNDP    ID = "net_ndp"
+
+	NTPStatus  ID = "ntp_status"
+	NTPPeers   ID = "ntp_peers"
+	NTPSensors ID = "ntp_sensors"
+	NTPAll     ID = "ntp_all"
+
+	SvcEnabled ID = "svc_enabled"
+	SvcStarted ID = "svc_started"
+	SvcFailed  ID = "svc_failed"
+
+	CheckPF      ID = "check_pf"
+	CheckBGPD    ID = "check_bgpd"
+	CheckHTTPD   ID = "check_httpd"
+	CheckRelayd  ID = "check_relayd"
+	CheckSMTPD   ID = "check_smtpd"
+	CheckIKED    ID = "check_iked"
+	CheckNTPD    ID = "check_ntpd"
+	CheckOSPFD   ID = "check_ospfd"
+	CheckOSPF6D  ID = "check_ospf6d"
+	CheckDHCPD   ID = "check_dhcpd"
+	CheckUnwind  ID = "check_unwind"
+	CheckVMD     ID = "check_vmd"
+	CheckSNMPD   ID = "check_snmpd"
+	CheckSSHD    ID = "check_sshd"
+	CheckUnbound ID = "check_unbound"
 )
 
 // Spec is an immutable command invocation.
@@ -101,6 +148,11 @@ func (s Spec) String() string {
 	return strings.Join(append([]string{p}, a...), " ")
 }
 
+// PsFields is the ps(1) -o column list. It uses "comm" (the program name)
+// and never "args"/"command": other users' full command lines can carry
+// passwords or tokens.
+const PsFields = "pid,ppid,user,stat,pcpu,pmem,rss,start,time,comm"
+
 // SysctlNames is the fixed set of MIBs queried by the system overview.
 // Every name here is readable by an unprivileged user on OpenBSD.
 var SysctlNames = []string{
@@ -124,6 +176,21 @@ func pfctl(modifier string) Spec {
 
 func unboundControl(verb string) Spec {
 	return Spec{Path: "/usr/sbin/unbound-control", Args: []string{verb}, Feature: FeatureUnbound, Doas: true}
+}
+
+func ntpctl(modifier string) Spec {
+	return Spec{Path: "/usr/sbin/ntpctl", Args: []string{"-s", modifier}, Feature: FeatureNTP, Doas: true}
+}
+
+func rcctlLs(what string) Spec {
+	return Spec{Path: "/usr/sbin/rcctl", Args: []string{"ls", what}, Feature: FeatureServices, Doas: true}
+}
+
+// configtest runs a daemon's check-only mode as root. Every argument list
+// here must be a documented "only check the configuration" mode; the
+// registry tests pin the allowed shapes.
+func configtest(path string, args ...string) Spec {
+	return Spec{Path: path, Args: args, Feature: FeatureConfCheck, Doas: true}
 }
 
 func bgpctl(show ...string) Spec {
@@ -165,6 +232,49 @@ var registry = map[ID]Spec{
 	BGPNexthops:   bgpctl("nexthop"),
 	BGPInterfaces: bgpctl("interfaces"),
 	BGPRIBMemory:  bgpctl("rib", "memory"),
+
+	// Always available and unprivileged. These must be ELF binaries, not
+	// scripts: exec'ing a script needs its interpreter unveiled "x" too.
+	Sensors:   {Path: "/sbin/sysctl", Args: []string{"hw.sensors"}},
+	Mounts:    {Path: "/sbin/mount"},
+	Swap:      {Path: "/sbin/swapctl", Args: []string{"-l"}},
+	ProcsCPU:  {Path: "/bin/ps", Args: []string{"-axr", "-o", PsFields}},
+	ProcsMem:  {Path: "/bin/ps", Args: []string{"-axm", "-o", PsFields}},
+	NetProto:  {Path: "/usr/bin/netstat", Args: []string{"-s"}},
+	NetIfaces: {Path: "/usr/bin/netstat", Args: []string{"-in"}},
+	NetMbufs:  {Path: "/usr/bin/netstat", Args: []string{"-m"}},
+	NetSock4:  {Path: "/usr/bin/netstat", Args: []string{"-an", "-f", "inet"}},
+	NetSock6:  {Path: "/usr/bin/netstat", Args: []string{"-an", "-f", "inet6"}},
+	NetARP:    {Path: "/usr/sbin/arp", Args: []string{"-an"}},
+	NetNDP:    {Path: "/usr/sbin/ndp", Args: []string{"-an"}},
+
+	// ntpd's control socket only implements show requests.
+	NTPStatus:  ntpctl("status"),
+	NTPPeers:   ntpctl("peers"),
+	NTPSensors: ntpctl("Sensors"),
+	NTPAll:     ntpctl("all"),
+
+	// rcctl ls only; never enable/disable/start/stop/set/order.
+	SvcEnabled: rcctlLs("on"),
+	SvcStarted: rcctlLs("started"),
+	SvcFailed:  rcctlLs("failed"),
+
+	// "Configtest mode. Only check the configuration file for validity."
+	CheckPF:      configtest("/sbin/pfctl", "-n", "-f", "/etc/pf.conf"),
+	CheckBGPD:    configtest("/usr/sbin/bgpd", "-n"),
+	CheckHTTPD:   configtest("/usr/sbin/httpd", "-n"),
+	CheckRelayd:  configtest("/usr/sbin/relayd", "-n"),
+	CheckSMTPD:   configtest("/usr/sbin/smtpd", "-n"),
+	CheckIKED:    configtest("/sbin/iked", "-n"),
+	CheckNTPD:    configtest("/usr/sbin/ntpd", "-n"),
+	CheckOSPFD:   configtest("/usr/sbin/ospfd", "-n"),
+	CheckOSPF6D:  configtest("/usr/sbin/ospf6d", "-n"),
+	CheckDHCPD:   configtest("/usr/sbin/dhcpd", "-n"),
+	CheckUnwind:  configtest("/sbin/unwind", "-n"),
+	CheckVMD:     configtest("/usr/sbin/vmd", "-n"),
+	CheckSNMPD:   configtest("/usr/sbin/snmpd", "-n"),
+	CheckSSHD:    configtest("/usr/sbin/sshd", "-t"),
+	CheckUnbound: configtest("/usr/sbin/unbound-checkconf"),
 }
 
 // BaseDirs are the only directories registered binaries may live in.
@@ -173,6 +283,9 @@ var BaseDirs = []string{"/bin", "/sbin", "/usr/bin", "/usr/sbin"}
 // socketDirs are where an absolute non-program argument (a control socket)
 // may point.
 var socketDirs = []string{"/var/run"}
+
+// configArgs are the only config files that may be named as an argument.
+var configArgs = map[string]bool{"/etc/pf.conf": true}
 
 // Enabled is the set of opt-in features the operator turned on.
 // The zero value enables none.
@@ -222,6 +335,9 @@ func Lookup(id ID, en Enabled) (Spec, error) {
 	return s, nil
 }
 
+// FeatureOf returns the feature that gates id ("" for always available).
+func FeatureOf(id ID) Feature { return registry[id].Feature }
+
 // Describe returns the display command line for id regardless of features,
 // or "" if id is unknown.
 func Describe(id ID) string {
@@ -268,8 +384,9 @@ func DoasRules(user string, en Enabled) ([]string, error) {
 		if !s.Doas || !en.allows(s.Feature) {
 			continue
 		}
-		out = append(out, fmt.Sprintf("permit nopass %s as root cmd %s args %s",
-			user, s.Path, strings.Join(s.Args, " ")))
+		// A bare "args" permits no arguments at all.
+		out = append(out, strings.TrimSpace(fmt.Sprintf("permit nopass %s as root cmd %s args %s",
+			user, s.Path, strings.Join(s.Args, " "))))
 	}
 	sort.Strings(out)
 	return out, nil
@@ -308,11 +425,11 @@ func validateSpec(s Spec) error {
 		if a == "" || strings.ContainsAny(a, "\x00\n\t ") {
 			return fmt.Errorf("arg %q is empty or contains whitespace/control characters", a)
 		}
-		// Absolute-path arguments may only name a base program or a control
-		// socket under /var/run.
+		// Absolute-path arguments may only name a base program, a control
+		// socket under /var/run or an allowlisted config file.
 		if strings.HasPrefix(a, "/") &&
-			(path.Clean(a) != a || !(inDirs(a, BaseDirs) || inDirs(a, socketDirs))) {
-			return fmt.Errorf("arg %q is a path outside base program or socket dirs", a)
+			(path.Clean(a) != a || !(inDirs(a, BaseDirs) || inDirs(a, socketDirs) || configArgs[a])) {
+			return fmt.Errorf("arg %q is a path outside base program, socket or config allowlists", a)
 		}
 	}
 	return nil

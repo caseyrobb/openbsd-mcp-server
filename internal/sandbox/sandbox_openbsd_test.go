@@ -21,6 +21,7 @@ import (
 
 	"golang.org/x/sys/unix"
 
+	"github.com/caseyrobb/openbsd-mcp-server/internal/audit"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/collect"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/confread"
@@ -145,8 +146,38 @@ func probeAllowed(conf *confread.Reader) int {
 			fail("exec %s: empty output", id)
 		}
 	}
+	// Every always-available *_status view. A non-zero exit still proves
+	// the sandbox let the command run (e.g. swapctl with no swap, ndp with
+	// IPv6 off); only exec/sandbox failures count.
+	for _, sub := range collect.Subsystems {
+		if sub.Feature != "" {
+			continue
+		}
+		for _, v := range sub.Views {
+			step("%s_status %s", sub.Name, v.Name)
+			res, err := (execx.Exec{}).Run(context.Background(), v.ID)
+			if err != nil && !errors.Is(err, execx.ErrNonZeroExit) {
+				fail("%s_status %s: %v", sub.Name, v.Name, err)
+			} else if err != nil {
+				fmt.Printf("note: %s_status %s exited non-zero: %s\n", sub.Name, v.Name,
+					strings.TrimSpace(res.Stderr))
+			}
+		}
+	}
+
+	// Audit: sendsyslog(2) works under the final pledge with nothing unveiled.
+	step("audit sendsyslog")
+	if l, err := audit.NewSyslog("obsd-mcp-test"); err != nil {
+		fail("audit.NewSyslog: %v", err)
+	} else if err := l.(interface {
+		Send(audit.Priority, string) error
+	}).Send(audit.Info, "event=sandbox_self_test"); err != nil {
+		fail("audit sendsyslog under pledge: %v", err)
+	}
+
 	// Opt-in commands stay refused when their feature is not enabled.
-	for _, id := range []basecmd.ID{basecmd.PfInfo, basecmd.UnboundStatus, basecmd.BGPSummary} {
+	for _, id := range []basecmd.ID{basecmd.PfInfo, basecmd.UnboundStatus, basecmd.BGPSummary,
+		basecmd.NTPStatus, basecmd.SvcEnabled, basecmd.CheckPF, basecmd.CheckSSHD} {
 		step("execx %s (not enabled)", id)
 		if _, err := (execx.Exec{}).Run(context.Background(), id); err == nil {
 			fail("%s ran without its feature enabled", id)
@@ -175,7 +206,8 @@ func probeAllowed(conf *confread.Reader) int {
 	// pf_info is not opted in. Stdout/Stderr must be set, as in execx: a nil
 	// writer makes os/exec open /dev/null O_WRONLY, which needs "wpath".
 	for _, bin := range []string{"/bin/sh", "/bin/ksh", "/usr/bin/doas", "/sbin/pfctl", "/bin/cat",
-		"/usr/sbin/unbound-control", "/usr/sbin/bgpctl"} {
+		"/usr/sbin/unbound-control", "/usr/sbin/bgpctl", "/usr/sbin/ntpctl", "/usr/sbin/rcctl",
+		"/usr/sbin/sshd", "/usr/sbin/bgpd"} {
 		step("exec %s", bin)
 		var out bytes.Buffer
 		cmd := exec.Command(bin)
@@ -201,8 +233,8 @@ func probeFeatures(en basecmd.Enabled) int {
 	var fails []string
 	r := execx.Exec{Enabled: en}
 	for _, sub := range collect.Subsystems {
-		if !en[sub.Feature] {
-			continue
+		if sub.Feature == "" || !en[sub.Feature] {
+			continue // always-available views run in the "allowed" scenario
 		}
 		for _, v := range sub.Views {
 			step("%s_status %s", sub.Name, v.Name)
@@ -213,7 +245,22 @@ func probeFeatures(en basecmd.Enabled) int {
 			}
 		}
 	}
-	for _, bin := range []string{"/sbin/pfctl", "/usr/sbin/unbound-control"} {
+	// Config checks: an invalid or absent config is a normal result; only
+	// a check that could not run (doas refused, exec failed) counts.
+	if en[basecmd.FeatureConfCheck] {
+		for _, v := range collect.ConfigChecks.Views {
+			step("config_check %s", v.Name)
+			res, err := collect.ConfigCheck(context.Background(), r, v.Name)
+			if err != nil {
+				fails = append(fails, fmt.Sprintf("config_check/%s: %v", v.Name, err))
+			} else {
+				fmt.Printf("note: config_check %s valid=%t\n", v.Name, res.Valid)
+			}
+		}
+	}
+	// The doas targets are never directly executable: only doas is unveiled.
+	for _, bin := range []string{"/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/ntpctl",
+		"/usr/sbin/rcctl", "/bin/ksh", "/usr/sbin/sshd", "/usr/sbin/bgpd"} {
 		step("direct exec %s", bin)
 		var out bytes.Buffer
 		cmd := exec.Command(bin)

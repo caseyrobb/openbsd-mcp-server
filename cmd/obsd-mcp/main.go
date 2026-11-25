@@ -10,10 +10,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/caseyrobb/openbsd-mcp-server/internal/audit"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/confread"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/execx"
@@ -24,7 +27,7 @@ import (
 func main() {
 	printPolicy := flag.Bool("print-policy", false, "print the unveil/pledge policy and exit")
 	unsafeDev := flag.Bool("unsafe-dev", false, "allow running without pledge/unveil on non-OpenBSD (development only)")
-	enable := flag.String("enable", "", "comma-separated opt-in features: pf, unbound, bgp")
+	enable := flag.String("enable", "", "comma-separated opt-in features: pf, unbound, bgp, ntp, services, confcheck")
 	printDoas := flag.String("print-doas", "", "print the doas.conf rules USER needs for -enable, then exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
@@ -82,11 +85,21 @@ func main() {
 		return
 	}
 
+	auditLog, err := audit.NewSyslog("obsd-mcp")
+	if err != nil {
+		// Not OpenBSD amd64/arm64 (e.g. -unsafe-dev on Linux): stderr.
+		auditLog = &audit.Writer{W: os.Stderr}
+	}
+
 	// Build everything that might need extra privileges *before* sandboxing.
 	server := mcpserver.New(mcpserver.Config{
-		Runner:   execx.Exec{Enabled: enabled},
+		Runner: execx.Exec{
+			Enabled: enabled,
+			Limit:   execx.NewLimiter(execx.DefaultConcurrency, execx.DefaultQueueWait),
+		},
 		Features: enabled,
 		Conf:     conf,
+		Audit:    auditLog,
 	})
 
 	skipped, err := sandbox.Apply(policy)
@@ -100,9 +113,36 @@ func main() {
 		log.Printf("unveil: %s not present, skipped", p)
 	}
 
+	start := time.Now()
+	auditLog.Log(audit.Info, fmt.Sprintf("event=session_start version=%s uid=%d features=%s ssh_client=%s",
+		audit.Sanitize(mcpserver.Version, 64), os.Getuid(), audit.Sanitize(featureList(enabled), 128),
+		audit.Sanitize(sshClient(), 64)))
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil && !errors.Is(err, context.Canceled) {
-		log.Fatal(err)
+	runErr := server.Run(ctx, &mcp.StdioTransport{})
+	auditLog.Log(audit.Info, fmt.Sprintf("event=session_end seconds=%d", int(time.Since(start).Seconds())))
+	if runErr != nil && !errors.Is(runErr, context.Canceled) {
+		log.Fatal(runErr)
 	}
+}
+
+// sshClient is the client address and port from SSH_CLIENT, set by sshd for
+// forced commands ("addr port localport"); empty for a local session.
+func sshClient() string {
+	f := strings.Fields(os.Getenv("SSH_CLIENT"))
+	if len(f) >= 2 {
+		return f[0] + " " + f[1]
+	}
+	return ""
+}
+
+func featureList(en basecmd.Enabled) string {
+	var out []string
+	for _, f := range basecmd.Features {
+		if en[f] {
+			out = append(out, string(f))
+		}
+	}
+	return strings.Join(out, ",")
 }

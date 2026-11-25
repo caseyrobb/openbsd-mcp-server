@@ -12,7 +12,13 @@ func TestRegistryValid(t *testing.T) {
 	}
 }
 
-var all = Enabled{FeaturePF: true, FeatureUnbound: true, FeatureBGP: true}
+var all = func() Enabled {
+	en := Enabled{}
+	for _, f := range Features {
+		en[f] = true
+	}
+	return en
+}()
 
 func TestRegistryHasNoPortsPaths(t *testing.T) {
 	for _, b := range Binaries(all) {
@@ -102,7 +108,10 @@ func TestBinariesPerFeature(t *testing.T) {
 		en         Enabled
 		want, deny []string
 	}{
-		{nil, nil, []string{DoasPath, "/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/bgpctl"}},
+		{nil, nil, []string{DoasPath, "/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/bgpctl",
+			"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/bin/ksh", "/bin/sh"}},
+		{all, []string{DoasPath, "/usr/sbin/bgpctl", "/bin/ps", "/usr/bin/netstat"},
+			[]string{"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/usr/sbin/bgpd", "/usr/sbin/sshd", "/bin/ksh", "/bin/sh"}},
 		{Enabled{FeaturePF: true}, []string{DoasPath}, []string{"/sbin/pfctl", "/usr/sbin/bgpctl"}},
 		{Enabled{FeatureUnbound: true}, []string{DoasPath}, []string{"/usr/sbin/unbound-control", "/usr/sbin/bgpctl"}},
 		{Enabled{FeatureBGP: true}, []string{"/usr/sbin/bgpctl"}, []string{DoasPath}},
@@ -128,6 +137,9 @@ func TestPfctlOnlyShows(t *testing.T) {
 	for id, s := range registry {
 		if s.Path != "/sbin/pfctl" {
 			continue
+		}
+		if id == CheckPF {
+			continue // TestConfigtestShapes
 		}
 		if !s.Doas || s.Feature != FeaturePF {
 			t.Errorf("%s: pfctl must be doas + feature pf", id)
@@ -172,6 +184,86 @@ func TestBgpctlOnlyShowOnRestrictedSocket(t *testing.T) {
 	}
 }
 
+func TestNtpctlOnlyShows(t *testing.T) {
+	safe := map[string]bool{"status": true, "peers": true, "Sensors": true, "all": true}
+	for id, s := range registry {
+		if s.Path != "/usr/sbin/ntpctl" {
+			continue
+		}
+		if !s.Doas || s.Feature != FeatureNTP || len(s.Args) != 2 || s.Args[0] != "-s" || !safe[s.Args[1]] {
+			t.Errorf("%s: ntpctl spec %+v is not doas + ntp + one -s modifier", id, s)
+		}
+	}
+}
+
+func TestRcctlOnlyLists(t *testing.T) {
+	safe := map[string]bool{"on": true, "started": true, "failed": true}
+	for id, s := range registry {
+		if s.Path != "/usr/sbin/rcctl" {
+			continue
+		}
+		// Through doas: rcctl is a ksh script and must never be exec'd by us.
+		if !s.Doas || s.Feature != FeatureServices || len(s.Args) != 2 || s.Args[0] != "ls" || !safe[s.Args[1]] {
+			t.Errorf("%s: rcctl spec %+v is not doas + services + ls <on|started|failed>", id, s)
+		}
+	}
+}
+
+// TestConfigtestShapes pins every confcheck command to a documented
+// check-only mode, so no entry can drift into loading a config.
+func TestConfigtestShapes(t *testing.T) {
+	n := 0
+	for id, s := range registry {
+		if s.Feature != FeatureConfCheck {
+			continue
+		}
+		n++
+		if !s.Doas {
+			t.Errorf("%s: configtest must run via doas", id)
+		}
+		args := strings.Join(s.Args, " ")
+		ok := false
+		switch s.Path {
+		case "/sbin/pfctl":
+			ok = args == "-n -f /etc/pf.conf"
+		case "/usr/sbin/sshd":
+			ok = args == "-t"
+		case "/usr/sbin/unbound-checkconf":
+			ok = args == ""
+		default:
+			ok = args == "-n"
+		}
+		if !ok {
+			t.Errorf("%s: %s %q is not a check-only invocation", id, s.Path, args)
+		}
+	}
+	if n == 0 {
+		t.Fatal("no confcheck commands")
+	}
+}
+
+func TestAlwaysOnCommandsAreUnprivileged(t *testing.T) {
+	for id, s := range registry {
+		if s.Feature == "" && s.Doas {
+			t.Errorf("%s: always-available commands must not use doas", id)
+		}
+	}
+}
+
+func TestPsNeverShowsArguments(t *testing.T) {
+	for _, f := range strings.Split(PsFields, ",") {
+		if f == "args" || f == "command" {
+			t.Errorf("ps field %q exposes full command lines", f)
+		}
+	}
+	for id, s := range registry {
+		if s.Path == "/bin/ps" && (len(s.Args) != 3 || s.Args[1] != "-o" || s.Args[2] != PsFields ||
+			strings.ContainsAny(s.Args[0], "ewE")) {
+			t.Errorf("%s: ps args %v", id, s.Args)
+		}
+	}
+}
+
 func TestArgvAddsDoasWrapper(t *testing.T) {
 	s, _ := Lookup(PfInfo, Enabled{FeaturePF: true})
 	p, a := s.Argv()
@@ -210,7 +302,7 @@ func TestDoasRules(t *testing.T) {
 	for _, s := range registry {
 		if s.Doas {
 			n++
-			want := "permit nopass u as root cmd " + s.Path + " args " + strings.Join(s.Args, " ")
+			want := strings.TrimSpace("permit nopass u as root cmd " + s.Path + " args " + strings.Join(s.Args, " "))
 			if !slices.Contains(everything, want) {
 				t.Errorf("no rule %q", want)
 			}
@@ -221,6 +313,11 @@ func TestDoasRules(t *testing.T) {
 	}
 	if len(rules(t, "u", Enabled{FeatureBGP: true})) != 0 {
 		t.Error("bgp must not need doas")
+	}
+	// A command without arguments gets a bare "args": doas then permits
+	// no arguments at all.
+	if !slices.Contains(everything, "permit nopass u as root cmd /usr/sbin/unbound-checkconf args") {
+		t.Error("missing bare-args unbound-checkconf rule")
 	}
 }
 

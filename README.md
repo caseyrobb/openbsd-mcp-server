@@ -17,7 +17,9 @@ anything, run arbitrary commands or read secrets.
   bounded, and have secret values such as `wpakey`, `wgkey`, `psk`,
   `password` and private key blocks replaced with `<redacted>`.
 * **Unprivileged.** The server refuses to run as root, and it needs no
-  `doas` unless you opt in to PF status.
+  `doas` unless you opt in to a feature that requires it.
+* **Audited.** Every tool call is logged to syslog with its arguments,
+  result and timing, never its output.
 
 The server speaks MCP over **stdio**. For remote use, sshd starts it with a
 forced command, so the server itself never opens a socket.
@@ -28,10 +30,15 @@ forced command, so the server itself never opens a socket.
 |---|---|
 | `system_overview` | `uname -a`, `uptime`, selected `kern.*`/`hw.*`/`vm.*` sysctl values, `df -h`, `vmstat` |
 | `network_summary` | `ifconfig` (redacted), `netstat -rn` |
+| `system_status` | One view: `sensors`, `mounts`, `swap`, `processes_cpu`, `processes_memory` (program names only, never command-line arguments) |
+| `network_status` | One view: `protocols` (`netstat -s`), `interfaces` (`netstat -in`), `mbufs`, `sockets_inet`, `sockets_inet6`, `arp`, `ndp` |
 | `config_read` | One allowlisted file from `/etc`, redacted. The allowed paths are listed in the tool's input schema. |
 | `pf_status` | **Opt-in** (`-enable pf`). One `pfctl -s` view: `info`, `rules`, `tables`, `memory`, `timeouts`, `interfaces`, `queues` |
 | `unbound_status` | **Opt-in** (`-enable unbound`). One `unbound-control` view: `status`, `stats` (`stats_noreset`), `forwards`, `stubs`, `local_zones`, `auth_zones`, `insecure` |
 | `bgp_status` | **Opt-in** (`-enable bgp`). One `bgpctl show` view: `summary`, `neighbors`, `nexthops`, `interfaces`, `rib_memory` |
+| `ntp_status` | **Opt-in** (`-enable ntp`). One `ntpctl -s` view: `status`, `peers`, `sensors`, `all` |
+| `services_status` | **Opt-in** (`-enable services`). One `rcctl ls` view: `enabled`, `started`, `failed` |
+| `config_check` | **Opt-in** (`-enable confcheck`). Runs one daemon's configtest mode (`-n`, `sshd -t`) and reports `valid` plus the checker's messages: `pf`, `bgpd`, `httpd`, `relayd`, `smtpd`, `iked`, `ntpd`, `ospfd`, `ospf6d`, `dhcpd`, `unwind`, `vmd`, `snmpd`, `sshd`, `unbound` |
 
 The `config_read` allowlist is `/etc/rc.conf.local`, `pf.conf`, `sysctl.conf`,
 `hosts`, `resolv.conf`, `myname`, `mygate`, `ntpd.conf`, `syslog.conf`,
@@ -106,9 +113,9 @@ restrict,command="/usr/local/libexec/obsd-mcp" ssh-ed25519 AAAA... agent-key
 The user needs a real login shell, because sshd runs forced commands through
 `$SHELL -c`.
 
-### Optional: pf, unbound and bgpd
+### Optional features
 
-These subsystems are off by default. Turn them on with `-enable` in the
+These are off by default. Turn them on with `-enable` in the
 forced command, for example:
 
 ```
@@ -120,12 +127,15 @@ restrict,command="/usr/local/libexec/obsd-mcp -enable pf,unbound,bgp" ssh-ed2551
 | `pf` | `/sbin/pfctl -s <view>` | `doas -n` (`/dev/pf` is 0600 root) | doas rules |
 | `unbound` | `/usr/sbin/unbound-control <verb>` | `doas -n` (the control socket allows reload, flush and stop, so the server user must not have it) | doas rules; unbound running with `remote-control` enabled (the default `/etc/unbound.conf` does this) |
 | `bgp` | `/usr/sbin/bgpctl -s /var/run/bgpd.rsock show <view>` | unprivileged, through bgpd's **restricted** socket, which only accepts `show` requests | add `socket "/var/run/bgpd.rsock" restricted` to `/etc/bgpd.conf`, then `doas bgpctl reload` |
+| `ntp` | `/usr/sbin/ntpctl -s <view>` | `doas -n` (ntpd's socket is 0660 root) | doas rules; ntpd running |
+| `services` | `/usr/sbin/rcctl ls on\|started\|failed` | `doas -n` (rcctl is a shell script, and `started`/`failed` need root) | doas rules |
+| `confcheck` | each daemon's `-n` configtest, `sshd -t`, `pfctl -n -f /etc/pf.conf`, `unbound-checkconf` | `doas -n` (most configs are 0600 root) | doas rules |
 
 Generate the exact `doas.conf` rules from the server itself, so they always
 match what it runs:
 
 ```sh
-/usr/local/libexec/obsd-mcp -enable pf,unbound -print-doas obsdmcp | doas tee -a /etc/doas.conf
+/usr/local/libexec/obsd-mcp -enable pf,unbound,ntp,services,confcheck -print-doas obsdmcp | doas tee -a /etc/doas.conf
 doas doas -C /etc/doas.conf    # syntax check
 ```
 
@@ -135,8 +145,26 @@ any other arguments. `unbound`'s statistics view uses `stats_noreset`: plain
 `stats` resets the counters and is never run.
 
 `doas` and `bgpctl` are unveiled only when a feature that needs them is
-enabled. `pfctl` and `unbound-control` are never executable by the server
-directly, only through `doas`.
+enabled. Programs run through `doas` (`pfctl`, `unbound-control`, `ntpctl`,
+`rcctl` and the daemons) are never executable by the server directly.
+A config check never loads anything: each daemon's flag is documented as
+"only check the configuration file for validity".
+
+## Audit log
+
+Each session and every tool call is logged through `syslogd` (facility
+`daemon`, so `/var/log/daemon` by default), including calls that were
+rejected:
+
+```
+obsd-mcp[4242]: event=session_start version="0.2.0" uid=1001 features="pf" ssh_client="192.0.2.7 50000"
+obsd-mcp[4242]: event=tool_call tool="pf_status" args={"view"="rules"} client="claude-code" ms=31 result=ok bytes=2210 redactions=0 truncated=false
+```
+
+Tool output is never logged. Client-supplied values are escaped and
+length-capped, so they cannot forge log lines. The server runs at most 4
+commands at once; extra calls wait up to 2 s, then fail with "too many
+commands running".
 
 ## Connect an MCP client
 
@@ -163,7 +191,7 @@ Or in a generic `mcpServers` JSON config:
 
 | Flag | Purpose |
 |---|---|
-| `-enable pf,unbound,bgp` | Enable the opt-in `*_status` tools (see above) |
+| `-enable pf,unbound,bgp,ntp,services,confcheck` | Enable opt-in tools (see above) |
 | `-print-doas USER` | Print the `doas.conf` rules USER needs for `-enable`, then exit |
 | `-print-policy` | Print the exact `unveil`/`pledge` calls and exit |
 | `-unsafe-dev` | Run without a sandbox on non-OpenBSD systems, for development only |
@@ -177,7 +205,9 @@ default. The server reports this clearly instead of failing silently.
 | Resource | Default | Readable? |
 |---|---|---|
 | sysctl values used, `ifconfig`, `netstat -rn`, `df`, `vmstat` | n/a | yes |
+| `ps`, `mount`, `swapctl`, `netstat -s/-in/-m/-an`, `arp`, `ndp`, `sysctl hw.sensors` | n/a | yes |
 | `pfctl` (`/dev/pf`) | 0600 root | only with `-enable pf` + doas rules |
+| ntpd control socket | 0660 root | only with `-enable ntp` + doas rules |
 | unbound control socket | 0660, full control | only with `-enable unbound` + doas rules |
 | bgpd restricted socket | 0666, show-only | with `-enable bgp`, once bgpd.conf creates it |
 | `/etc/pf.conf` | 0600 | no, unless you grant group read |
@@ -202,8 +232,8 @@ of non-allowlisted binaries fail, and that writes, sockets and further
 ```sh
 go test ./internal/sandbox -run Sandbox -v    # on OpenBSD, as a non-root user
 
-# after host setup, also run every pf/unbound/bgp view inside the sandbox:
-OBSDMCP_TEST_FEATURES=pf,unbound,bgp go test ./internal/sandbox -run Sandbox -v
+# after host setup, also run every opt-in view inside the sandbox:
+OBSDMCP_TEST_FEATURES=pf,unbound,bgp,ntp,services,confcheck go test ./internal/sandbox -run Sandbox -v
 ```
 
 ### Releases and versioning
@@ -212,7 +242,10 @@ OBSDMCP_TEST_FEATURES=pf,unbound,bgp go test ./internal/sandbox -run Sandbox -v
 requests and on version tags. It runs the Linux tests, cross-compiles the
 server and its test binaries for amd64 and arm64, then boots an OpenBSD VM
 for each architecture. In the VM it runs every test, including the real
-`pledge`/`unveil` sandbox tests, and builds the package with `pkg_create`.
+`pledge`/`unveil` sandbox tests. It then installs the `-print-doas` rules
+for `pf`, `services`, `confcheck` (and `ntp` if ntpd runs) and runs every
+view of those features inside the sandbox through doas. Finally it builds
+the package with `pkg_create`.
 
 Versions follow [semantic versioning](https://semver.org) and come from git
 tags (`scripts/version.sh`):
@@ -249,6 +282,7 @@ internal/sandbox/    unveil/pledge policy (portable) and Apply (OpenBSD only)
 internal/collect/    system and network collectors (no MCP dependency)
 internal/confread/   allowlisted config reader with path and file checks
 internal/redact/     secret redaction
+internal/audit/      syslog audit lines via sendsyslog(2), input sanitizing
 internal/mcpserver/  MCP tool definitions (the only package using the SDK)
 docs/                architecture and security notes
 ```

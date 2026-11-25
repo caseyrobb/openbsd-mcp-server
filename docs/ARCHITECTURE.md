@@ -62,9 +62,27 @@ results are still returned. A cancelled context fails the whole call.
 
 ifconfig output is passed through `redact` in case a key is ever shown.
 
-### Opt-in subsystems: `pf_status`, `unbound_status`, `bgp_status`
+### Always-available views: `system_status`, `network_status`
 
-Enabled with `-enable pf,unbound,bgp`. Each feature gates a group of registry
+Unprivileged commands, each a single fixed argv. They must be ELF
+binaries: `execve(2)` of a script repeats the exec check on its
+interpreter under the same unveil (`exec_script.c` calls `check_exec`
+again with the caller's `nameidata`, which has `ni_unveil = UNVEIL_EXEC`),
+so a script would need `/bin/ksh` unveiled `x`. That is why `rcctl`
+(a ksh script) only runs through doas: doas execs it after our unveil is
+gone.
+
+| Tool | Views |
+|---|---|
+| `system_status` | `sensors` (`sysctl hw.sensors`), `mounts` (`mount`), `swap` (`swapctl -l`), `processes_cpu` / `processes_memory` (`ps -axr` / `-axm -o pid,ppid,user,stat,pcpu,pmem,rss,start,time,comm`) |
+| `network_status` | `protocols` (`netstat -s`), `interfaces` (`netstat -in`), `mbufs` (`netstat -m`), `sockets_inet` / `sockets_inet6` (`netstat -an -f inet[6]`), `arp` (`arp -an`), `ndp` (`ndp -an`) |
+
+`ps` uses `comm` (the program name) and never `args`/`command`: other
+users' full command lines can carry passwords. A registry test enforces it.
+
+### Opt-in subsystems
+
+Enabled with `-enable pf,unbound,bgp,ntp,services,confcheck`. Each feature gates a group of registry
 entries (`basecmd.Spec.Feature`). A disabled feature's commands are refused by
 `basecmd.Lookup`, so by `execx` too. Its programs are not unveiled, and its
 tool is not registered. Each tool takes one `view` from a fixed enum
@@ -76,6 +94,9 @@ one registry ID, and its output is redacted.
 | `pf` | `doas -n /sbin/pfctl -s <modifier>` | `/dev/pf` is 0600 root. |
 | `unbound` | `doas -n /usr/sbin/unbound-control <verb>` | The default `/etc/unbound.conf` enables `/var/run/unbound.sock`, which unbound chmods to 0660. That socket accepts **every** command (reload, flush, stop), so giving the server user socket access would allow changes. doas pins one read-only verb per rule instead. |
 | `bgp` | `/usr/sbin/bgpctl -s /var/run/bgpd.rsock show ...` (no doas) | `socket "path" restricted` in bgpd.conf makes bgpd create a 0666 socket. `control.c` accepts only `IMSG_CTL_SHOW_*` messages on it, so it is read-only in the daemon itself. |
+| `ntp` | `doas -n /usr/sbin/ntpctl -s <status\|peers\|Sensors\|all>` | ntpd's `control.c` only implements show requests, but chmods the socket 0660, so an unprivileged user cannot connect. |
+| `services` | `doas -n /usr/sbin/rcctl ls <on\|started\|failed>` | rcctl is a ksh script (see above), and `ls started\|failed` call `needs_root`. `ls failed` exits 1 when it lists anything; `collect` treats that as a result, not an error. |
+| `confcheck` | `doas -n <daemon> -n` (`sshd -t`, `pfctl -n -f /etc/pf.conf`, `unbound-checkconf`) | Every daemon's man page documents the flag as "Configtest mode. Only check the configuration file for validity." The configs are mostly 0600 root. The `config_check` tool returns `valid=false` plus the checker's messages as a normal result; only a check that cannot run (doas refusal, exec failure) is a tool error. |
 
 Registry tests enforce the read-only argument shape:
 
@@ -83,10 +104,15 @@ Registry tests enforce the read-only argument shape:
 * unbound-control must be a single verb: `status`, `stats_noreset` or
   `list_*`. Plain `stats` resets counters, and the test rejects it.
 * bgpctl must start with `-s /var/run/bgpd.rsock show`.
+* ntpctl must be `-s <modifier>`; rcctl must be `ls <on|started|failed>`.
+* Every confcheck entry must be exactly `-n`, `sshd -t`,
+  `pfctl -n -f /etc/pf.conf` or no arguments (`unbound-checkconf`), so no
+  entry can drift into loading a configuration.
+* Commands without a feature never use doas.
 * Arguments may not contain whitespace, so every argument stays one doas.conf
   token.
-* An absolute-path argument must name a base program or a socket under
-  `/var/run`.
+* An absolute-path argument must name a base program, a socket under
+  `/var/run` or an allowlisted config file (`/etc/pf.conf`).
 
 `Spec.Path` is always the real program. `Spec.Doas` adds the
 `/usr/bin/doas -n` wrapper in `Spec.Argv()`, which is used both for exec and
@@ -160,6 +186,42 @@ The confread denylist refuses these even if they are allowlisted:
 `/usr/local /etc/pkg /var/db/pkg /etc/ssl/private /etc/iked /etc/isakmpd /root
 /home`. `sandbox.NewPolicy` separately refuses to unveil the same secret
 stores and package trees.
+
+## Audit log and limits
+
+Every `tools/call` (and `initialize`, for clients that send it) produces one
+syslog line, tag `obsd-mcp[pid]`, facility `daemon`:
+
+```
+obsd-mcp[4242]: event=session_start version="0.2.0" uid=1001 features="pf,confcheck" ssh_client="192.0.2.7 50000"
+obsd-mcp[4242]: event=tool_call tool="pf_status" args={"view"="rules"} client="claude-code" ms=31 result=ok bytes=2210 redactions=0 truncated=false
+obsd-mcp[4242]: event=tool_call tool="config_check" args={"daemon"="bgpd"} client="claude-code" ms=80 result=ok bytes=190 redactions=0 truncated=false valid=false
+obsd-mcp[4242]: event=tool_call tool="pf_status" args={"view"="flush"} client="claude-code" ms=0 result=tool_error error="validating \"arguments\": ..."
+obsd-mcp[4242]: event=session_end seconds=95
+```
+
+* It is an SDK receiving middleware (`mcpserver/audit.go`), so it also sees
+  calls rejected before a handler runs (unknown tool, schema violation).
+* Tool output is never logged, only its size and the redaction and
+  truncation counts.
+* Every client-supplied string (tool name, argument keys and values, client
+  name) goes through `audit.Sanitize`: it is ASCII-quoted with
+  `strconv.QuoteToASCII` and length-capped, so it cannot inject newlines or
+  fake `key=value` pairs. At most 4 argument keys are logged.
+* The client name is taken from the session on every line, because clients
+  on the sessionless protocol (2026-07-28) never send `initialize`.
+* Lines go to syslogd through `sendsyslog(2)`, which `kern_pledge.c` marks
+  `PLEDGE_ALWAYS`. Auditing therefore needs no pledge promise, no unveil
+  path and no socket; Go's `log/syslog` would need `unix` and `/dev/log`.
+  Neither `syscall` nor x/sys wraps it, so `internal/audit` calls libc's
+  `sendsyslog` with the same trampoline pattern x/sys uses for every libc
+  call on OpenBSD (amd64 and arm64). If syslogd is down, the server says
+  so once on stderr and keeps serving.
+* Off OpenBSD (`-unsafe-dev`), audit lines go to stderr.
+
+`execx` runs at most 4 commands at once (`execx.Limiter`). A call waits up
+to 2 s for a slot, then fails with "too many commands running"; the command
+timeout starts only once the slot is held.
 
 ## unveil / pledge
 

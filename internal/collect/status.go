@@ -18,9 +18,15 @@ type View struct {
 	Description string
 }
 
-// Subsystem is one opt-in daemon/tool family exposed as a *_status tool.
+// nonZeroOK lists commands whose non-zero exit is part of the answer
+// (rcctl ls failed exits 1 when it lists anything). A doas refusal is
+// still an error.
+var nonZeroOK = map[basecmd.ID]bool{basecmd.SvcFailed: true}
+
+// Subsystem is one command family exposed as a <Name>_status tool.
 type Subsystem struct {
-	Name    string // "pf", "unbound", "bgp"
+	Name string // "pf", "unbound", "bgp", "system", ...
+	// Feature gates the whole tool; "" means always available.
 	Feature basecmd.Feature
 	Views   []View // order is the order shown in the schema enum
 	// Hint is appended to errors that look like an access/setup problem.
@@ -71,8 +77,58 @@ var (
 	}
 )
 
-// Subsystems lists all opt-in subsystems.
-var Subsystems = []Subsystem{PF, Unbound, BGP}
+// Always-available subsystems: unprivileged commands only.
+var (
+	SystemViews = Subsystem{
+		Name: "system",
+		Views: []View{
+			{"sensors", basecmd.Sensors, "sysctl hw.sensors: temperatures, fans, voltages, batteries (empty if none)"},
+			{"mounts", basecmd.Mounts, "mount: mounted filesystems and options"},
+			{"swap", basecmd.Swap, "swapctl -l: swap devices and usage"},
+			{"processes_cpu", basecmd.ProcsCPU, "ps -axr: all processes by CPU (program name only, no arguments)"},
+			{"processes_memory", basecmd.ProcsMem, "ps -axm: all processes by memory (program name only, no arguments)"},
+		},
+	}
+	NetworkViews = Subsystem{
+		Name: "network",
+		Views: []View{
+			{"protocols", basecmd.NetProto, "netstat -s: per-protocol statistics (ip, tcp, udp, icmp, ...)"},
+			{"interfaces", basecmd.NetIfaces, "netstat -in: per-interface packets, errors and collisions"},
+			{"mbufs", basecmd.NetMbufs, "netstat -m: network memory (mbuf) usage"},
+			{"sockets_inet", basecmd.NetSock4, "netstat -an -f inet: IPv4 sockets and listeners"},
+			{"sockets_inet6", basecmd.NetSock6, "netstat -an -f inet6: IPv6 sockets and listeners"},
+			{"arp", basecmd.NetARP, "arp -an: IPv4 neighbor (ARP) table"},
+			{"ndp", basecmd.NetNDP, "ndp -an: IPv6 neighbor table"},
+		},
+	}
+)
+
+// Opt-in subsystems that need doas.
+var (
+	NTP = Subsystem{
+		Name: "ntp", Feature: basecmd.FeatureNTP,
+		Views: []View{
+			{"status", basecmd.NTPStatus, "ntpctl -s status: sync state and clock offset"},
+			{"peers", basecmd.NTPPeers, "ntpctl -s peers: servers, offset, delay, jitter"},
+			{"sensors", basecmd.NTPSensors, "ntpctl -s Sensors: time sensors in use"},
+			{"all", basecmd.NTPAll, "ntpctl -s all: status, peers and sensors"},
+		},
+		Hint: "ntpctl runs via 'doas -n' and needs ntpd running; " +
+			"check /etc/doas.conf against: obsd-mcp -enable ntp -print-doas <user>",
+	}
+	Services = Subsystem{
+		Name: "services", Feature: basecmd.FeatureServices,
+		Views: []View{
+			{"enabled", basecmd.SvcEnabled, "rcctl ls on: services enabled at boot"},
+			{"started", basecmd.SvcStarted, "rcctl ls started: services currently running"},
+			{"failed", basecmd.SvcFailed, "rcctl ls failed: enabled services that are not running"},
+		},
+		Hint: "rcctl runs via 'doas -n'; check /etc/doas.conf against: obsd-mcp -enable services -print-doas <user>",
+	}
+)
+
+// Subsystems lists every *_status tool, always-available ones first.
+var Subsystems = []Subsystem{SystemViews, NetworkViews, PF, Unbound, BGP, NTP, Services}
 
 // ViewNames returns the view names in order (the schema enum).
 func (s Subsystem) ViewNames() []string {
@@ -95,6 +151,8 @@ type StatusResult struct {
 	Truncated bool   `json:"truncated,omitempty"`
 	// Redactions counts values removed from the output.
 	Redactions int `json:"redactions,omitempty"`
+	// ExitStatus is set when a NonZeroOK view exited non-zero.
+	ExitStatus int `json:"exit_status,omitempty"`
 }
 
 // Status runs one view. A failing command is returned as an error (the tool
@@ -115,13 +173,20 @@ func Status(ctx context.Context, r execx.Runner, s Subsystem, view string) (Stat
 	if cerr := ctx.Err(); cerr != nil {
 		return StatusResult{}, cerr
 	}
+	if err != nil && nonZeroOK[v.ID] && errors.Is(err, execx.ErrNonZeroExit) &&
+		!strings.HasPrefix(strings.TrimSpace(res.Stderr), "doas:") {
+		err = nil
+	}
 	if err != nil {
 		msg := err.Error()
 		if line := strings.TrimSpace(res.Stderr); line != "" {
 			l, _ := redact.Line(firstLine(line))
 			msg += ": " + l
 		}
-		return StatusResult{}, fmt.Errorf("%s (hint: %s)", msg, s.Hint)
+		if s.Hint != "" {
+			msg += " (hint: " + s.Hint + ")"
+		}
+		return StatusResult{}, errors.New(msg)
 	}
 
 	red := redact.Text(strings.TrimRight(res.Stdout, "\n"))
@@ -132,5 +197,6 @@ func Status(ctx context.Context, r execx.Runner, s Subsystem, view string) (Stat
 		Output:     red.Text,
 		Truncated:  res.Truncated,
 		Redactions: red.Count,
+		ExitStatus: res.ExitCode,
 	}, nil
 }
