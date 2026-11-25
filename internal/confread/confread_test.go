@@ -103,8 +103,35 @@ func TestNotAllowlistedRejected(t *testing.T) {
 	_ = root
 }
 
-func TestSymlinkRejected(t *testing.T) {
-	r, root := fakeRoot(t, map[string]string{"etc/secret": "wpakey x\n"})
+// A file that is a symlink when the server starts is dropped from the
+// allowlist entirely (never unveiled, never in the schema enum).
+func TestSymlinkAtStartupExcluded(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "etc"), 0o755)
+	os.WriteFile(filepath.Join(root, "etc/secret"), []byte("wpakey x\n"), 0o644)
+	if err := os.Symlink(filepath.Join(root, "etc/secret"), filepath.Join(root, "etc/hosts")); err != nil {
+		t.Fatal(err)
+	}
+	r, err := newReader(root, os.Getuid(), MaxSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(r.Paths(), "/etc/hosts") {
+		t.Error("symlinked /etc/hosts is still allowlisted (would be unveiled)")
+	}
+	if _, err := r.Read("/etc/hosts"); !errors.Is(err, ErrSymlink) {
+		t.Errorf("err = %v, want ErrSymlink", err)
+	}
+	if ex := r.Excluded(); len(ex) != 1 || !strings.HasPrefix(ex[0], "/etc/hosts: ") {
+		t.Errorf("Excluded() = %v", ex)
+	}
+}
+
+// A file swapped for a symlink after startup is caught at request time by
+// lstat (and O_NOFOLLOW).
+func TestSymlinkSwappedAfterStartupRejected(t *testing.T) {
+	r, root := fakeRoot(t, map[string]string{"etc/hosts": "127.0.0.1 localhost\n", "etc/secret": "wpakey x\n"})
+	os.Remove(filepath.Join(root, "etc/hosts"))
 	if err := os.Symlink(filepath.Join(root, "etc/secret"), filepath.Join(root, "etc/hosts")); err != nil {
 		t.Fatal(err)
 	}
@@ -113,17 +140,38 @@ func TestSymlinkRejected(t *testing.T) {
 	}
 }
 
-func TestSymlinkedAncestorRejected(t *testing.T) {
-	r, root := fakeRoot(t, nil)
+// A symlinked ancestor directory at startup excludes every file under it.
+// (After the sandbox is applied, unveil binds to vnodes, so a later ancestor
+// swap cannot reach a file that was not unveiled; that is covered by the
+// OpenBSD integration test, not here.)
+func TestSymlinkedAncestorExcludedAtStartup(t *testing.T) {
+	root := t.TempDir()
+	os.MkdirAll(filepath.Join(root, "etc"), 0o755)
 	other := filepath.Join(root, "elsewhere")
 	os.MkdirAll(other, 0o755)
 	os.WriteFile(filepath.Join(other, "sshd_config"), []byte("Port 22\n"), 0o644)
-	os.RemoveAll(filepath.Join(root, "etc/ssh"))
 	if err := os.Symlink(other, filepath.Join(root, "etc/ssh")); err != nil {
 		t.Fatal(err)
 	}
+	r, err := newReader(root, os.Getuid(), MaxSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(r.Paths(), "/etc/ssh/sshd_config") {
+		t.Error("file under symlinked ancestor is still allowlisted")
+	}
 	if _, err := r.Read("/etc/ssh/sshd_config"); !errors.Is(err, ErrSymlink) {
 		t.Fatalf("err = %v, want ErrSymlink", err)
+	}
+}
+
+func TestMissingFileStaysAllowlisted(t *testing.T) {
+	r, _ := fakeRoot(t, nil)
+	if !slices.Contains(r.Paths(), "/etc/mygate") {
+		t.Error("absent file should stay allowlisted (unveil skips ENOENT)")
+	}
+	if len(r.Excluded()) != 0 {
+		t.Errorf("Excluded() = %v", r.Excluded())
 	}
 }
 

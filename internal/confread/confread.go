@@ -7,7 +7,13 @@
 //  2. deny: known secret stores and package paths are refused even if they
 //     were accidentally allowlisted
 //  3. allow: exact match against the startup-computed allowlist
-//  4. resolve: realpath must equal the requested path (no symlinked ancestors)
+//  4. resolve: at construction time (before the sandbox), every allowlisted
+//     path whose realpath differs from itself is dropped from the allowlist,
+//     so it is never unveiled. This cannot be done per request on OpenBSD:
+//     unveil(2) returns ENOENT for lstat of an ancestor directory such as
+//     /etc that was not itself unveiled, so filepath.EvalSymlinks fails.
+//     After the sandbox is applied, unveil binds to vnodes, so a later
+//     ancestor swap cannot redirect a lookup to a file that was not unveiled.
 //  5. lstat: regular file, not a symlink, owned by root
 //  6. open O_RDONLY|O_NOFOLLOW|O_NONBLOCK, fstat, and require the same inode as
 //     step 5 (closes the swap race)
@@ -84,10 +90,11 @@ type File struct {
 // Reader holds the allowlist. Create it before the sandbox is applied (the
 // hostname.* glob needs to list /etc).
 type Reader struct {
-	root    string // "" in production; a temp dir in tests
-	allowed map[string]bool
-	owner   int // required uid; production is 0
-	max     int64
+	root     string // "" in production; a temp dir in tests
+	allowed  map[string]bool
+	excluded map[string]error // allowlisted but rejected at startup
+	owner    int              // required uid; production is 0
+	max      int64
 }
 
 // New returns the production reader: the Fixed allowlist plus every
@@ -95,7 +102,7 @@ type Reader struct {
 func New() (*Reader, error) { return newReader("", 0, MaxSize) }
 
 func newReader(root string, owner int, max int64) (*Reader, error) {
-	r := &Reader{root: root, allowed: map[string]bool{}, owner: owner, max: max}
+	r := &Reader{root: root, allowed: map[string]bool{}, excluded: map[string]error{}, owner: owner, max: max}
 	for _, p := range Fixed {
 		r.allowed[p] = true
 	}
@@ -116,7 +123,36 @@ func newReader(root string, owner int, max int64) (*Reader, error) {
 			return nil, fmt.Errorf("confread: allowlist entry %q is denylisted", p)
 		}
 	}
+	// Realpath check, once, while ancestors are still visible. A missing
+	// file stays allowlisted (Read reports ErrNotPresent); a path that
+	// resolves anywhere else is removed and will never be unveiled.
+	for p := range r.allowed {
+		if err := r.checkResolved(r.full(p)); errors.Is(err, ErrSymlink) {
+			delete(r.allowed, p)
+			r.excluded[p] = err
+		} else if err != nil && !errors.Is(err, ErrNotPresent) {
+			return nil, fmt.Errorf("confread: resolving %q: %w", p, err)
+		}
+	}
 	return r, nil
+}
+
+// Excluded returns allowlisted paths that were dropped at startup, with the
+// reason, sorted by path. main logs these.
+func (r *Reader) Excluded() []string {
+	out := make([]string, 0, len(r.excluded))
+	for p, err := range r.excluded {
+		out = append(out, p+": "+err.Error())
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (r *Reader) full(p string) string {
+	if r.root == "" {
+		return p
+	}
+	return filepath.Join(r.root, p)
 }
 
 // Paths returns the sorted allowlist. The sandbox unveils each with "r".
@@ -192,13 +228,13 @@ func (r *Reader) Read(p string) (File, error) {
 	if denied(p) {
 		return File{}, ErrDenied
 	}
+	if err, ok := r.excluded[p]; ok {
+		return File{}, err
+	}
 	if !r.allowed[p] {
 		return File{}, ErrNotAllowed
 	}
-	full := filepath.Join(r.root, p)
-	if r.root == "" {
-		full = p
-	}
+	full := r.full(p)
 
 	lfi, err := os.Lstat(full)
 	if err != nil {
@@ -209,9 +245,6 @@ func (r *Reader) Read(p string) (File, error) {
 	}
 	if !lfi.Mode().IsRegular() {
 		return File{}, ErrNotRegular
-	}
-	if err := r.checkResolved(full); err != nil {
-		return File{}, err
 	}
 	if st, ok := lfi.Sys().(*syscall.Stat_t); ok && r.owner >= 0 && int(st.Uid) != r.owner {
 		return File{}, ErrOwner
@@ -253,7 +286,8 @@ func (r *Reader) Read(p string) (File, error) {
 }
 
 // checkResolved is the realpath check: the fully resolved path must be the
-// requested path, so no ancestor directory may be a symlink.
+// requested path, so neither the file nor any ancestor may be a symlink.
+// Call it only before the sandbox is applied (see step 4 above).
 func (r *Reader) checkResolved(full string) error {
 	real, err := filepath.EvalSymlinks(full)
 	if err != nil {

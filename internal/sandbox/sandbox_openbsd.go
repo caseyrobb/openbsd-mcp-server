@@ -14,9 +14,16 @@ import (
 // after all initialisation and before the first MCP request is read. Any
 // failure is fatal to the caller: we never continue unsandboxed.
 //
+// The working directory is set to "/" first; see execx.newCmd.
+//
 // A missing file (ENOENT) is skipped rather than fatal, so an absent optional
 // config like /etc/rc.conf.local does not stop startup; it stays invisible.
 func Apply(p Policy) (skipped []string, err error) {
+	// Move to "/" while it is still visible. Children inherit this cwd, so
+	// execx never asks a forked (still-unveiled) child to chdir.
+	if err := unix.Chdir("/"); err != nil {
+		return nil, fmt.Errorf("chdir(\"/\"): %w", err)
+	}
 	for _, r := range p.Unveil {
 		if err := unix.Unveil(r.Path, r.Perms); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {

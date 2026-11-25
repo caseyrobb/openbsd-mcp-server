@@ -90,10 +90,14 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 // does not apply. The open needs "wpath", and pledge kills the server with
 // SIGABRT ("pledge wpath, syscall 5"). Stdin stays nil: os/exec then opens
 // /dev/null O_RDONLY, which "rpath" plus the unveil "r" rule allow.
+//
+// Dir MUST stay empty. A non-empty Dir makes the forked child chdir(2)
+// before execve, while it still carries our unveil restrictions, and "/"
+// is not unveiled, so this fails with ENOENT. Instead, sandbox.Apply
+// chdirs the server to "/" before unveiling, and children inherit that cwd.
 func newCmd(ctx context.Context, spec basecmd.Spec, max int) (*exec.Cmd, *BoundedBuffer, *BoundedBuffer) {
 	cmd := exec.CommandContext(ctx, spec.Path, spec.Args...)
 	cmd.Env = fixedEnv
-	cmd.Dir = "/"
 	cmd.Stdin = nil
 	stdout := &BoundedBuffer{Max: max}
 	stderr := &BoundedBuffer{Max: max}

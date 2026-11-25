@@ -87,8 +87,18 @@ the handler runs. The handler validates again anyway, in this order:
    allowlisted by mistake.
 2. Look `p` up exactly in the allowlist. `/etc/hostname.*` is expanded once at
    startup against `^hostname\.[a-z]+[0-9]+$`.
-3. `EvalSymlinks` must return the path unchanged (no symlinked ancestors).
-   `Lstat` the file. It must be a regular file (no symlink) owned by uid 0.
+3. At startup, before the sandbox, any allowlisted path whose
+   `EvalSymlinks` result differs from itself (the file or an ancestor is a
+   symlink) is dropped from the allowlist. It is never unveiled, never put in
+   the enum, and logged by `main`. Per request, `Lstat` the file: it must be a
+   regular file (no symlink) owned by uid 0.
+
+   The realpath check can't run per request. Under unveil, `lstat("/etc")`
+   returns ENOENT, because `unveil_check_final()` only lets through
+   directories that were explicitly unveiled, and `/etc` is not. Unveiling
+   individual files does not make their parent directories visible. After
+   `Apply`, unveil is bound to vnodes, so swapping an ancestor for a symlink
+   cannot reach a file that was not unveiled.
 4. Open with `O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, then `Fstat`. The dev/inode must
    match step 3, which closes the TOCTOU window. Content over 64 KiB is
    truncated and flagged. Content containing NUL is refused as binary.
@@ -151,6 +161,13 @@ unveil("/usr/bin/vmstat", "x");
 unveil(NULL, NULL);
 pledge("stdio rpath proc exec", NULL);
 ```
+
+**Child working directory.** `Apply` calls `chdir("/")` before the first
+`unveil`, and `execx` leaves `cmd.Dir` empty. A non-empty `Dir` makes the
+forked child `chdir` before `execve` while it still has the parent's unveil
+restrictions, and `/` isn't visible then (seen on hardware as
+`chdir /: no such file or directory`). `execx.TestNewCmdDoesNotChdir` guards
+this.
 
 **Child stdio and `/dev/null`.** Child stdin is left nil, so os/exec opens
 `/dev/null` read-only, which `rpath` plus the unveil `"r"` rule allow.
@@ -231,8 +248,10 @@ constructor is exported.
 **real** policy. Each scenario re-execs the test binary as a child that applies
 the production policy and then probes it:
 
-* **allowed**: `confread.Read("/etc/hosts")` and `sysctl` through the real
-  runner succeed. Opening `master.passwd`, `spwd.db`, `passwd`, `doas.conf`,
+* **allowed**: `confread.Read` of `/etc/hosts` and `/etc/ssh/sshd_config`
+  succeeds, every non-opt-in command (`sysctl uname uptime df vmstat
+  ifconfig netstat`) runs through the real runner, and `pf_info` is refused
+  without opt-in. Opening `master.passwd`, `spwd.db`, `passwd`, `doas.conf`,
   ssh host keys, `/usr/local`, `/etc/rc` and `/var/log/messages` fails.
   Listing `/etc` fails. Executing `sh`, `ksh`, `doas`, `pfctl` and `cat` fails.
 * **write / devnull-write / socket / unveil**: creating a file, opening

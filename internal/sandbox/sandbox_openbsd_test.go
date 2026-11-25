@@ -108,11 +108,31 @@ func probeAllowed(conf *confread.Reader) int {
 		fail("confread /etc/hosts: unexpected content")
 	}
 	// Allowed: an allowlisted base binary via the real runner.
+	// A file below an ancestor that is not itself unveiled (/etc/ssh).
+	step("confread /etc/ssh/sshd_config")
+	if _, err := conf.Read("/etc/ssh/sshd_config"); err != nil && !errors.Is(err, confread.ErrNotPresent) {
+		fail("confread /etc/ssh/sshd_config: %v", err)
+	}
+
+	// Allowed: every non-opt-in production command via the real runner.
 	step("execx sysctl")
 	if res, err := (execx.Exec{}).Run(context.Background(), basecmd.Sysctl); err != nil {
 		fail("exec sysctl: %v", err)
 	} else if !strings.Contains(res.Stdout, "kern.ostype=OpenBSD") {
 		fail("exec sysctl: unexpected output %q", res.Stdout)
+	}
+	for _, id := range []basecmd.ID{basecmd.Uname, basecmd.Uptime, basecmd.Df, basecmd.Vmstat, basecmd.Ifconfig, basecmd.Routes} {
+		step("execx %s", id)
+		if res, err := (execx.Exec{}).Run(context.Background(), id); err != nil {
+			fail("exec %s: %v (stderr %q)", id, err, res.Stderr)
+		} else if strings.TrimSpace(res.Stdout) == "" {
+			fail("exec %s: empty output", id)
+		}
+	}
+	// Opt-in commands stay refused when not enabled.
+	step("execx pf_info (not enabled)")
+	if _, err := (execx.Exec{}).Run(context.Background(), basecmd.PfInfo); err == nil {
+		fail("pf_info ran without opt-in")
 	}
 
 	// Denied reads: not unveiled, so ENOENT/EACCES regardless of file mode.

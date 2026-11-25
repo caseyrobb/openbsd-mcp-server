@@ -72,8 +72,18 @@ func TestNewCmdNeverWritesDevNull(t *testing.T) {
 	if cmd.Stdin != nil {
 		t.Fatal("Stdin should be nil (read-only /dev/null, covered by unveil r)")
 	}
-	if cmd.Dir != "/" || len(cmd.Env) != len(fixedEnv) {
-		t.Errorf("dir=%q env=%v", cmd.Dir, cmd.Env)
+	if len(cmd.Env) != len(fixedEnv) {
+		t.Errorf("env=%v", cmd.Env)
+	}
+}
+
+// Regression: a non-empty Dir makes the child chdir after fork, under the
+// parent's unveil, where "/" is not visible ("chdir /: no such file").
+func TestNewCmdDoesNotChdir(t *testing.T) {
+	spec, _ := basecmd.Lookup(basecmd.Uname, nil)
+	cmd, _, _ := newCmd(context.Background(), spec, 16)
+	if cmd.Dir != "" {
+		t.Fatalf("Dir = %q; must be empty (sandbox.Apply sets cwd before unveil)", cmd.Dir)
 	}
 }
 

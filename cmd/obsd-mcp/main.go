@@ -49,6 +49,9 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	for _, x := range conf.Excluded() {
+		log.Printf("config_read: excluded %s", x)
+	}
 
 	policy, err := sandbox.NewPolicy(basecmd.Binaries(enabled), conf.Paths())
 	if err != nil {
