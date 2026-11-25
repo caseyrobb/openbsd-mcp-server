@@ -83,6 +83,9 @@ type Exec struct {
 // fixedEnv is the entire environment children see. No inherited variables.
 var fixedEnv = []string{"PATH=/bin:/sbin:/usr/bin:/usr/sbin", "LC_ALL=C"}
 
+// ErrTimeout is wrapped when the command is killed at its time limit.
+var ErrTimeout = errors.New("timed out")
+
 // ErrNonZeroExit is wrapped when the command exits non-zero.
 var ErrNonZeroExit = errors.New("non-zero exit")
 
@@ -91,10 +94,7 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	timeout, max := e.Timeout, e.MaxOutput
-	if timeout <= 0 {
-		timeout = DefaultTimeout
-	}
+	timeout, max := timeoutFor(spec, e.Timeout), e.MaxOutput
 	if max <= 0 {
 		max = DefaultMaxOutput
 	}
@@ -116,7 +116,7 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 		Truncated: stdout.Truncated() || stderr.Truncated(),
 	}
 	if ctx.Err() == context.DeadlineExceeded {
-		return res, fmt.Errorf("%s: timed out after %s", id, timeout)
+		return res, fmt.Errorf("%s: %w after %s", id, ErrTimeout, timeout)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(runErr, &exitErr) {
@@ -127,6 +127,18 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 		return res, fmt.Errorf("%s: %w", id, runErr)
 	}
 	return res, nil
+}
+
+// timeoutFor is the runner's timeout (or DefaultTimeout), raised to the
+// command's own Timeout when that is longer.
+func timeoutFor(spec basecmd.Spec, def time.Duration) time.Duration {
+	if def <= 0 {
+		def = DefaultTimeout
+	}
+	if spec.Timeout > def {
+		return spec.Timeout
+	}
+	return def
 }
 
 // newCmd builds the exec.Cmd for spec.

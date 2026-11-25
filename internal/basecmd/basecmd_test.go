@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegistryValid(t *testing.T) {
@@ -340,6 +341,23 @@ func TestParseFeatures(t *testing.T) {
 	for _, bad := range []string{"pf,ipsec", "PF", "all", "pf;unbound"} {
 		if _, err := ParseFeatures(bad); err == nil {
 			t.Errorf("ParseFeatures(%q) accepted", bad)
+		}
+	}
+}
+
+// Only commands known to be slow get a longer limit, and it stays bounded.
+func TestSpecTimeouts(t *testing.T) {
+	for _, id := range []ID{SvcEnabled, SvcStarted, SvcFailed} {
+		if registry[id].Timeout != RcctlTimeout {
+			t.Errorf("%s: timeout %s, want %s", id, registry[id].Timeout, RcctlTimeout)
+		}
+	}
+	for id, s := range registry {
+		if s.Timeout < 0 || s.Timeout > time.Minute {
+			t.Errorf("%s: timeout %s out of range", id, s.Timeout)
+		}
+		if s.Timeout != 0 && s.Path != "/usr/sbin/rcctl" {
+			t.Errorf("%s: unexpected custom timeout %s", id, s.Timeout)
 		}
 	}
 }

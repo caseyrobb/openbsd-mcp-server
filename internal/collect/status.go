@@ -183,7 +183,8 @@ func Status(ctx context.Context, r execx.Runner, s Subsystem, view string) (Stat
 			l, _ := redact.Line(firstLine(line))
 			msg += ": " + l
 		}
-		if s.Hint != "" {
+		// A timeout is not an access problem; the setup hint would mislead.
+		if s.Hint != "" && !errors.Is(err, execx.ErrTimeout) {
 			msg += " (hint: " + s.Hint + ")"
 		}
 		return StatusResult{}, errors.New(msg)

@@ -153,3 +153,28 @@ func TestRunBusyDoesNotExec(t *testing.T) {
 		t.Fatalf("err = %v, want ErrBusy", err)
 	}
 }
+
+func TestTimeoutFor(t *testing.T) {
+	rc, err := basecmd.Lookup(basecmd.SvcEnabled, basecmd.Enabled{basecmd.FeatureServices: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plain, err := basecmd.Lookup(basecmd.Mounts, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		spec basecmd.Spec
+		def  time.Duration
+		want time.Duration
+	}{
+		{plain, 0, DefaultTimeout},
+		{plain, time.Second, time.Second},
+		{rc, 0, basecmd.RcctlTimeout},
+		{rc, time.Minute, time.Minute}, // never lowers the runner's limit
+	} {
+		if got := timeoutFor(c.spec, c.def); got != c.want {
+			t.Errorf("timeoutFor(%s, %s) = %s, want %s", c.spec.Path, c.def, got, c.want)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package collect
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -142,5 +143,14 @@ func TestStatusNonZeroOKIsAResult(t *testing.T) {
 	f = &errRunner{res: execx.Result{Stdout: "x\n", ExitCode: 1}, err: nonZero(basecmd.SvcStarted)}
 	if _, err := Status(context.Background(), f, Services, "started"); err == nil {
 		t.Fatal("non-zero exit accepted for started")
+	}
+}
+
+// A timeout is not a doas/setup problem, so the setup hint is left out.
+func TestStatusTimeoutHasNoHint(t *testing.T) {
+	f := &errRunner{err: fmt.Errorf("%s: %w after 30s", basecmd.SvcStarted, execx.ErrTimeout)}
+	_, err := Status(context.Background(), f, Services, "started")
+	if err == nil || strings.Contains(err.Error(), "hint") || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("err = %v", err)
 	}
 }

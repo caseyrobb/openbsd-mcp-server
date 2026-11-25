@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
 // ID names an allowlisted command invocation.
@@ -132,6 +133,9 @@ type Spec struct {
 	// Doas runs the command as root via "doas -n Path Args...", which needs
 	// a matching exact-args rule (see DoasRules).
 	Doas bool
+	// Timeout, when longer than the runner's default, is this command's
+	// limit. rcctl runs a shell per service and needs it on slow hosts.
+	Timeout time.Duration
 }
 
 // Argv returns the program to execve and its arguments.
@@ -182,8 +186,13 @@ func ntpctl(modifier string) Spec {
 	return Spec{Path: "/usr/sbin/ntpctl", Args: []string{"-s", modifier}, Feature: FeatureNTP, Doas: true}
 }
 
+// RcctlTimeout bounds rcctl ls, which runs an rc.d script check per service.
+// 5s was too short on an emulated arm64 VM even for "ls on".
+const RcctlTimeout = 30 * time.Second
+
 func rcctlLs(what string) Spec {
-	return Spec{Path: "/usr/sbin/rcctl", Args: []string{"ls", what}, Feature: FeatureServices, Doas: true}
+	return Spec{Path: "/usr/sbin/rcctl", Args: []string{"ls", what}, Feature: FeatureServices, Doas: true,
+		Timeout: RcctlTimeout}
 }
 
 // configtest runs a daemon's check-only mode as root. Every argument list
