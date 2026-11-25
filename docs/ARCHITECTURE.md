@@ -152,6 +152,17 @@ unveil(NULL, NULL);
 pledge("stdio rpath proc exec", NULL);
 ```
 
+**Child stdio and `/dev/null`.** Child stdin is left nil, so os/exec opens
+`/dev/null` read-only, which `rpath` plus the unveil `"r"` rule allow.
+Stdout and stderr are always bounded in-memory buffers (pipes). If either
+were nil, os/exec would open `/dev/null` `O_WRONLY`. The kernel's `/dev/null`
+exemption in `pledge_namei()` applies only to libc's private
+`__pledge_open()`, and Go calls `open(2)` directly, so that open needs
+`wpath` and pledge kills the process. This was seen on real hardware
+(`pledge "wpath", syscall 5`). The fix is to keep the buffers, not to add
+`wpath`. `execx.TestNewCmdNeverWritesDevNull` and the `devnull-write`
+sandbox scenario guard it.
+
 Files are unveiled one at a time, never `/etc`, so a path-validation bug still
 cannot reach `/etc/master.passwd`. A missing file (ENOENT) is skipped and
 logged.
@@ -224,11 +235,15 @@ the production policy and then probes it:
   runner succeed. Opening `master.passwd`, `spwd.db`, `passwd`, `doas.conf`,
   ssh host keys, `/usr/local`, `/etc/rc` and `/var/log/messages` fails.
   Listing `/etc` fails. Executing `sh`, `ksh`, `doas`, `pfctl` and `cat` fails.
-* **write / socket / unveil**: creating a file, opening a TCP socket, or
-  calling `unveil` again must kill the child with SIGABRT (pledge violation)
-  or fail cleanly. Success is a test failure.
+* **write / devnull-write / socket / unveil**: creating a file, opening
+  `/dev/null` for writing, opening a TCP socket, or calling `unveil` again
+  must kill the child with SIGABRT (pledge violation) or fail cleanly.
+  Success is a test failure.
+* Each probe prints `step: ...` before it runs. If the child is killed, the
+  last step line in the failure output names the probe that did it.
 
-Run it on an OpenBSD host as an unprivileged user:
+Requires Go 1.26 or later (the MCP SDK's minimum). Run it on an OpenBSD host
+as an unprivileged user:
 
 ```
 go test ./internal/sandbox -run Sandbox -v

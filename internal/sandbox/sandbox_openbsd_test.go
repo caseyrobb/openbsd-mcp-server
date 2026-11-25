@@ -8,6 +8,7 @@ package sandbox
 // SIGABRT. The child applies the production policy, then probes it.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -68,6 +69,15 @@ func child(mode string) int {
 			c.Close()
 			return 1
 		}
+	case "devnull-write":
+		// Documents why execx must never leave Stdout/Stderr nil: Go opens
+		// /dev/null with plain open(2), which gets no __pledge_open exemption.
+		f, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+		fmt.Println("devnull write open returned:", err)
+		if err == nil {
+			f.Close()
+			return 1
+		}
 	case "unveil":
 		err := unix.Unveil("/", "r")
 		fmt.Println("unveil returned:", err)
@@ -81,18 +91,24 @@ func child(mode string) int {
 	return 0
 }
 
+// step announces the next probe on stdout (unbuffered), so if pledge kills
+// the child, the parent's output shows exactly which probe did it.
+func step(format string, a ...any) { fmt.Printf("step: "+format+"\n", a...) }
+
 func probeAllowed(conf *confread.Reader) int {
 	var fails []string
 	fail := func(f string, a ...any) { fails = append(fails, fmt.Sprintf(f, a...)) }
 
 	// Allowed: an allowlisted 0644 config through the full confread pipeline
 	// (this also proves EvalSymlinks/lstat on unveiled ancestors works).
+	step("confread /etc/hosts")
 	if f, err := conf.Read("/etc/hosts"); err != nil {
 		fail("confread /etc/hosts: %v", err)
 	} else if !strings.Contains(f.Content, "localhost") {
 		fail("confread /etc/hosts: unexpected content")
 	}
 	// Allowed: an allowlisted base binary via the real runner.
+	step("execx sysctl")
 	if res, err := (execx.Exec{}).Run(context.Background(), basecmd.Sysctl); err != nil {
 		fail("exec sysctl: %v", err)
 	} else if !strings.Contains(res.Stdout, "kern.ostype=OpenBSD") {
@@ -104,6 +120,7 @@ func probeAllowed(conf *confread.Reader) int {
 		"/etc/master.passwd", "/etc/spwd.db", "/etc/passwd", "/etc/doas.conf",
 		"/etc/ssh/ssh_host_ed25519_key", "/usr/local", "/etc/rc", "/var/log/messages",
 	} {
+		step("open %s", path)
 		if f, err := os.Open(path); err == nil {
 			f.Close()
 			fail("open %s succeeded", path)
@@ -111,17 +128,24 @@ func probeAllowed(conf *confread.Reader) int {
 			fail("open %s: unexpected error %v", path, err)
 		}
 	}
+	step("readdir /etc")
 	if _, err := os.ReadDir("/etc"); err == nil {
 		fail("listing /etc succeeded")
 	}
 
 	// Denied exec: anything not in the registry, including doas when
-	// pf_info is not opted in.
+	// pf_info is not opted in. Stdout/Stderr must be set, as in execx: a nil
+	// writer makes os/exec open /dev/null O_WRONLY, which needs "wpath".
 	for _, bin := range []string{"/bin/sh", "/bin/ksh", "/usr/bin/doas", "/sbin/pfctl", "/bin/cat"} {
-		if err := exec.Command(bin).Run(); err == nil {
+		step("exec %s", bin)
+		var out bytes.Buffer
+		cmd := exec.Command(bin)
+		cmd.Stdout, cmd.Stderr = &out, &out
+		if err := cmd.Run(); err == nil {
 			fail("exec %s succeeded", bin)
 		}
 	}
+	step("done")
 
 	if len(fails) > 0 {
 		fmt.Println(strings.Join(fails, "\n"))
@@ -156,7 +180,7 @@ func TestSandboxAllowsOnlyPolicy(t *testing.T) {
 // SIGABRT. A clean error return is also acceptable (still no effect), but a
 // success is a failure.
 func TestSandboxForbiddenOperations(t *testing.T) {
-	for _, mode := range []string{"write", "socket", "unveil"} {
+	for _, mode := range []string{"write", "devnull-write", "socket", "unveil"} {
 		t.Run(mode, func(t *testing.T) {
 			out, ws := runChild(t, mode)
 			switch {

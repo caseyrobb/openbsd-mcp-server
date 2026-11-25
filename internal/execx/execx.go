@@ -61,15 +61,7 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, spec.Path, spec.Args...)
-	cmd.Env = fixedEnv
-	cmd.Dir = "/"
-	cmd.Stdin = nil // os/exec opens /dev/null read-only; unveiled "r"
-	stdout := &BoundedBuffer{Max: max}
-	stderr := &BoundedBuffer{Max: max}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	cmd.WaitDelay = time.Second
-
+	cmd, stdout, stderr := newCmd(ctx, spec, max)
 	runErr := cmd.Run()
 	res := Result{
 		Stdout:    stdout.String(),
@@ -88,6 +80,26 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 		return res, fmt.Errorf("%s: %w", id, runErr)
 	}
 	return res, nil
+}
+
+// newCmd builds the exec.Cmd for spec.
+//
+// Stdout and Stderr MUST be non-nil writers. When they are nil, os/exec opens
+// /dev/null with O_WRONLY in this process before forking. Go calls open(2)
+// directly, not libc's __pledge_open(), so the kernel's /dev/null exemption
+// does not apply. The open needs "wpath", and pledge kills the server with
+// SIGABRT ("pledge wpath, syscall 5"). Stdin stays nil: os/exec then opens
+// /dev/null O_RDONLY, which "rpath" plus the unveil "r" rule allow.
+func newCmd(ctx context.Context, spec basecmd.Spec, max int) (*exec.Cmd, *BoundedBuffer, *BoundedBuffer) {
+	cmd := exec.CommandContext(ctx, spec.Path, spec.Args...)
+	cmd.Env = fixedEnv
+	cmd.Dir = "/"
+	cmd.Stdin = nil
+	stdout := &BoundedBuffer{Max: max}
+	stderr := &BoundedBuffer{Max: max}
+	cmd.Stdout, cmd.Stderr = stdout, stderr
+	cmd.WaitDelay = time.Second
+	return cmd, stdout, stderr
 }
 
 // BoundedBuffer keeps at most Max bytes and silently discards the rest,

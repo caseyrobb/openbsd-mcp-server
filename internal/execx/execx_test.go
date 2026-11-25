@@ -2,6 +2,7 @@ package execx
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -48,6 +49,31 @@ func TestRunRejectsOptInNotEnabled(t *testing.T) {
 	_, err := Exec{}.Run(context.Background(), basecmd.PfInfo)
 	if err == nil || !strings.Contains(err.Error(), "not enabled") {
 		t.Fatalf("got %v, want opt-in rejection", err)
+	}
+}
+
+// Regression: a nil Stdout/Stderr makes os/exec open /dev/null for writing,
+// which needs pledge "wpath" and aborts the sandboxed server on OpenBSD.
+func TestNewCmdNeverWritesDevNull(t *testing.T) {
+	spec, err := basecmd.Lookup(basecmd.Uname, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, _, _ := newCmd(context.Background(), spec, 16)
+	if cmd.Stdout == nil || cmd.Stderr == nil {
+		t.Fatal("Stdout/Stderr must be set; nil means O_WRONLY open of /dev/null")
+	}
+	if _, ok := cmd.Stdout.(*os.File); ok {
+		t.Fatal("Stdout must not be an *os.File")
+	}
+	if _, ok := cmd.Stderr.(*os.File); ok {
+		t.Fatal("Stderr must not be an *os.File")
+	}
+	if cmd.Stdin != nil {
+		t.Fatal("Stdin should be nil (read-only /dev/null, covered by unveil r)")
+	}
+	if cmd.Dir != "/" || len(cmd.Env) != len(fixedEnv) {
+		t.Errorf("dir=%q env=%v", cmd.Dir, cmd.Env)
 	}
 }
 
