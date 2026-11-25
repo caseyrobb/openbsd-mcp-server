@@ -1,0 +1,11 @@
+obsd-mcp is a read-only Model Context Protocol (MCP) server that lets an AI
+agent inspect the OpenBSD base system: system overview, network state,
+allowlisted /etc config files with secrets redacted, and optional pf,
+unbound and bgpd status.
+
+It is sandboxed with unveil(2) and pledge(2), runs only fixed base-system
+commands without a shell, refuses to run as root, and has no tools that
+write files or change system state. It speaks MCP over stdio; use an
+ssh(1) forced command for remote access.
+
+The server binary is installed as /usr/local/libexec/obsd-mcp.

@@ -26,7 +26,13 @@ func main() {
 	unsafeDev := flag.Bool("unsafe-dev", false, "allow running without pledge/unveil on non-OpenBSD (development only)")
 	enable := flag.String("enable", "", "comma-separated opt-in features: pf, unbound, bgp")
 	printDoas := flag.String("print-doas", "", "print the doas.conf rules USER needs for -enable, then exit")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println(mcpserver.Name, mcpserver.Version)
+		return
+	}
 
 	// MCP owns stdout; all diagnostics go to stderr.
 	log.SetOutput(os.Stderr)

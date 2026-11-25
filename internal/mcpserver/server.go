@@ -15,10 +15,13 @@ import (
 	"github.com/caseyrobb/openbsd-mcp-server/internal/execx"
 )
 
-const (
-	Name    = "obsd-mcp"
-	Version = "0.1.0"
-)
+// Name is the MCP implementation name.
+const Name = "obsd-mcp"
+
+// Version is the semantic version reported to clients. Release builds set it
+// with -ldflags "-X github.com/caseyrobb/openbsd-mcp-server/internal/mcpserver.Version=..."
+// (see scripts/version.sh); plain go build reports "dev".
+var Version = "dev"
 
 // ConfigReader is what config_read needs from the config reader. The
 // production implementation is *confread.Reader, which owns all path

@@ -62,11 +62,35 @@ GOOS=openbsd GOARCH=amd64 CGO_ENABLED=0 go build -o obsd-mcp ./cmd/obsd-mcp
 
 ## Install
 
+### From a release package
+
+Every [GitHub release](https://github.com/caseyrobb/openbsd-mcp-server/releases)
+has a `pkg_add` package for amd64 and arm64, named
+`obsd-mcp-<version>-<arch>.tgz`, plus a `SHA256` file. The packages are not
+signed, so check the checksum first:
+
+```sh
+ftp https://github.com/caseyrobb/openbsd-mcp-server/releases/download/v0.1.0/obsd-mcp-0.1.0-amd64.tgz
+ftp https://github.com/caseyrobb/openbsd-mcp-server/releases/download/v0.1.0/SHA256
+sha256 -C SHA256 obsd-mcp-0.1.0-amd64.tgz
+doas pkg_add -D unsigned ./obsd-mcp-0.1.0-amd64.tgz
+```
+
+This installs `/usr/local/libexec/obsd-mcp`. The `dev` prerelease always
+holds a build of the latest `main`.
+
+### From source
+
+```sh
+doas install -o root -g bin -m 0555 obsd-mcp /usr/local/libexec/obsd-mcp
+```
+
+### Set up the user
+
 Create a dedicated unprivileged user. Do **not** add it to `wheel`.
 
 ```sh
 doas useradd -m -s /bin/ksh -c "read-only MCP" obsdmcp
-doas install -o root -g bin -m 0555 obsd-mcp /usr/local/libexec/obsd-mcp
 ```
 
 Any root-owned location that the `obsdmcp` user cannot write to will do. The
@@ -143,6 +167,7 @@ Or in a generic `mcpServers` JSON config:
 | `-print-doas USER` | Print the `doas.conf` rules USER needs for `-enable`, then exit |
 | `-print-policy` | Print the exact `unveil`/`pledge` calls and exit |
 | `-unsafe-dev` | Run without a sandbox on non-OpenBSD systems, for development only |
+| `-version` | Print the version and exit |
 
 ## Privileges and file modes
 
@@ -181,9 +206,42 @@ go test ./internal/sandbox -run Sandbox -v    # on OpenBSD, as a non-root user
 OBSDMCP_TEST_FEATURES=pf,unbound,bgp go test ./internal/sandbox -run Sandbox -v
 ```
 
+### Releases and versioning
+
+`.github/workflows/release.yml` runs on every push to `main`, on pull
+requests and on version tags. It runs the Linux tests, cross-compiles the
+server and its test binaries for amd64 and arm64, then boots an OpenBSD VM
+for each architecture. In the VM it runs every test, including the real
+`pledge`/`unveil` sandbox tests, and builds the package with `pkg_create`.
+
+Versions follow [semantic versioning](https://semver.org) and come from git
+tags (`scripts/version.sh`):
+
+| Build | Version | Package | Published as |
+|---|---|---|---|
+| tag `v1.2.0` | `1.2.0` | `obsd-mcp-1.2.0-<arch>.tgz` | release `v1.2.0` |
+| tag `v1.3.0-rc.1` (also `-alpha.N`, `-beta.N`) | `1.3.0-rc.1` | `obsd-mcp-1.3.0rc1-<arch>.tgz` | prerelease `v1.3.0-rc.1` |
+| push to `main`, 4 commits after `v1.2.0` | `1.2.1-dev.4+g<sha>` | `obsd-mcp-1.2.1pre4-<arch>.tgz` | the rolling `dev` prerelease, replaced on each push |
+| pull request | as for `main` | built, not published | nothing |
+
+To cut a release, tag a commit that is on `main` and push the tag:
+
+```sh
+git tag -a v0.1.0 -m "obsd-mcp 0.1.0"
+git push origin v0.1.0
+```
+
+Tags that are not `vMAJOR.MINOR.PATCH[-(alpha|beta|rc).N]`, or that point
+outside `main`, fail the workflow. OpenBSD sorts `pre` and `rc` versions
+before the plain version, so `pkg_add -u` upgrades from a dev or rc build to
+the final release.
+
 ### Layout
 
 ```
+.github/workflows/   CI: test, OpenBSD VM tests, pkg_create packages, releases
+scripts/             version.sh (tags -> semver), build.sh, vmtest.sh, mkpkg.sh
+pkg/DESCR            package description
 cmd/obsd-mcp/        entry point: refuse root, build policy, sandbox, serve stdio
 internal/basecmd/    allowlist of runnable base binaries and their fixed argv
 internal/execx/      no-shell runner: scrubbed env, timeout, bounded output

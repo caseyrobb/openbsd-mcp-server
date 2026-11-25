@@ -1,0 +1,158 @@
+# Build, test and package obsd-mcp for OpenBSD.
+#
+# - Every push to main: tests, then OpenBSD packages for amd64 and arm64,
+#   published to the rolling "dev" prerelease (replaced on each push).
+# - A pushed tag vMAJOR.MINOR.PATCH[-(alpha|beta|rc).N]: the same build,
+#   published as a GitHub release for that tag.
+# - Pull requests: tests and packages only, nothing is published.
+#
+# Versions come from git tags; see scripts/version.sh.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Superseded main builds are cancelled; tag builds always finish.
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
+env:
+  OPENBSD_VERSION: '8.0'
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      pkg_version: ${{ steps.v.outputs.pkg_version }}
+      release_tag: ${{ steps.v.outputs.release_tag }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags and history for the version
+          persist-credentials: false
+      - name: Release tags must be on main
+        if: github.ref_type == 'tag'
+        run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || {
+            echo "::error::tag $GITHUB_REF_NAME is not on main"; exit 1; }
+      - id: v
+        run: |
+          sh scripts/version.sh | tee -a "$GITHUB_OUTPUT"
+          sh scripts/version.sh | sed 's/^/    /' >> "$GITHUB_STEP_SUMMARY"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l . | tee /dev/stderr)"
+      - name: go vet
+        run: |
+          go vet ./...
+          GOOS=openbsd GOARCH=amd64 go vet ./...
+          GOOS=openbsd GOARCH=arm64 go vet ./...
+      - name: go test
+        run: go test -race ./...
+
+  package:
+    needs: [version, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            vm_arch: x86-64
+          - goarch: arm64
+            vm_arch: arm64
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      PKG_VERSION: ${{ needs.version.outputs.pkg_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - name: Cross-compile server and test binaries
+        run: sh scripts/build.sh "$VERSION" "${{ matrix.goarch }}" "dist/${{ matrix.goarch }}"
+
+      - name: Start OpenBSD ${{ env.OPENBSD_VERSION }} VM (${{ matrix.vm_arch }})
+        uses: cross-platform-actions/action@f4288ce47b91d3f0f4f05a29824393beda26ac3c # v1.8.0
+        with:
+          operating_system: openbsd
+          architecture: ${{ matrix.vm_arch }}
+          version: ${{ env.OPENBSD_VERSION }}
+          shell: sh
+          sync_files: runner-to-vm
+
+      - name: Test on OpenBSD (includes the real pledge/unveil sandbox tests)
+        shell: cpa.sh {0} --sync-files none
+        run: |
+          ./dist/${{ matrix.goarch }}/obsd-mcp -version
+          sh scripts/vmtest.sh dist/${{ matrix.goarch }}
+
+      - name: Build package with pkg_create
+        shell: cpa.sh {0} --sync-files vm-to-runner --environment-variables PKG_VERSION
+        run: sh scripts/mkpkg.sh "$PKG_VERSION" dist/${{ matrix.goarch }}/obsd-mcp dist/pkg
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: pkg-${{ matrix.goarch }}
+          path: dist/pkg/*.tgz
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push'
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+      TAG: ${{ needs.version.outputs.release_tag }}
+      PRERELEASE: ${{ needs.version.outputs.prerelease }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums (verify on OpenBSD with sha256 -C SHA256 <file>)
+        working-directory: dist
+        run: |
+          sha256sum --tag *.tgz > SHA256
+          cat SHA256
+      - name: Publish tagged release
+        if: github.ref_type == 'tag'
+        run: |
+          flags=""
+          [ "$PRERELEASE" = true ] && flags="--prerelease"
+          gh release create "$TAG" dist/* --verify-tag $flags \
+            --title "obsd-mcp $VERSION" --generate-notes
+      - name: Publish rolling dev prerelease
+        if: github.ref_type == 'branch'
+        run: |
+          gh release delete dev --cleanup-tag --yes || true
+          gh release create dev dist/* --prerelease --target "$GITHUB_SHA" \
+            --title "Development build $VERSION" \
+            --notes "Automated build of main at $GITHUB_SHA ($VERSION). Replaced on every push; not a stable release."
