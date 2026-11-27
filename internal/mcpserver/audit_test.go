@@ -3,6 +3,7 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -108,7 +109,8 @@ func TestFormatArgs(t *testing.T) {
 		``:                                     `{}`,
 		`{}`:                                   `{}`,
 		`{"view":"rules"}`:                     `{"view"="rules"}`,
-		`{"n":5,"b":true}`:                     `{"b"=<bool>,"n"=<float64>}`,
+		`{"n":5,"b":true}`:                     `{"b"=true,"n"=5}`,
+		`{"n":1e300,"o":{"x":1},"l":[1]}`:      `{"l"=<[]interface {}>,"n"=1e+300,"o"=<map[string]interface {}>}`,
 		`not json`:                             `<invalid json, 8 bytes>`,
 		`{"a":"","b":"","c":"","d":"","e":""}`: `{"a"="","b"="","c"="","d"="",+1 more}`,
 	}
@@ -137,5 +139,38 @@ func TestConfigCheckToolOnlyWithFeature(t *testing.T) {
 		Arguments: map[string]any{"daemon": "named"}})
 	if err == nil && !res.IsError {
 		t.Error("config_check accepted unknown daemon")
+	}
+}
+
+func TestLogTailToolOnlyWithFeature(t *testing.T) {
+	cs, _ := connectWith(t, Config{Runner: stubRunner{}})
+	if slices.Contains(toolNames(t, cs), "log_tail") {
+		t.Fatal("log_tail registered without logs")
+	}
+	cs, _ = connectWith(t, Config{Runner: stubRunner{}, Features: basecmd.Enabled{basecmd.FeatureLogs: true}})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "log_tail",
+		Arguments: map[string]any{"log": "authlog", "lines": 5, "match": "sshd"}})
+	if err != nil || res.IsError {
+		t.Fatalf("err=%v res=%s", err, callText(res))
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	var got collect.LogTailResult
+	json.Unmarshal(raw, &got)
+	if got.Log != "authlog" || got.Command != "/usr/bin/doas -n /usr/bin/tail -n 1000 /var/log/authlog" {
+		t.Errorf("got %+v", got)
+	}
+	// The schema rejects paths, out-of-range counts and extra arguments
+	// before anything runs.
+	for _, args := range []map[string]any{
+		{"log": "/etc/master.passwd"},
+		{"log": "authlog", "lines": 100000},
+		{"log": "authlog", "lines": 0.5},
+		{"log": "authlog", "file": "/etc/spwd.db"},
+		{"lines": 5},
+	} {
+		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "log_tail", Arguments: args})
+		if err == nil && !res.IsError {
+			t.Errorf("args %v accepted: %s", args, callText(res))
+		}
 	}
 }

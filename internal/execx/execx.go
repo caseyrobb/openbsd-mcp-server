@@ -98,6 +98,9 @@ func (e Exec) Run(ctx context.Context, id basecmd.ID) (Result, error) {
 	if max <= 0 {
 		max = DefaultMaxOutput
 	}
+	if spec.MaxOutput > max {
+		max = spec.MaxOutput
+	}
 	if e.Limit != nil {
 		if err := e.Limit.acquire(ctx); err != nil {
 			return Result{}, fmt.Errorf("%s: %w", id, err)

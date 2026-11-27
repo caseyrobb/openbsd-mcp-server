@@ -77,3 +77,89 @@ func TestTextPublicMaterialKept(t *testing.T) {
 		t.Errorf("certificate should not be redacted: %q", r.Text)
 	}
 }
+
+func TestAuthLine(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"sshd[1]: Invalid user hunter2 from 192.0.2.7 port 50000",
+			"sshd[1]: Invalid user <redacted> from 192.0.2.7 port 50000"},
+		{"sshd[1]: Failed password for invalid user admin from 192.0.2.7 port 22 ssh2",
+			"sshd[1]: Failed password for invalid user <redacted> from 192.0.2.7 port 22 ssh2"},
+		{"sshd[1]: Connection closed by invalid user s3cr3t pass 192.0.2.7 port 4 [preauth]",
+			"sshd[1]: Connection closed by invalid user <redacted> 192.0.2.7 port 4 [preauth]"},
+		{"sshd[1]: Disconnected from invalid user bob 2001:db8::1 port 22 [preauth]",
+			"sshd[1]: Disconnected from invalid user <redacted> 2001:db8::1 port 22 [preauth]"},
+		{"sshd[1]: input_userauth_request: invalid user x y [preauth]",
+			"sshd[1]: input_userauth_request: invalid user <redacted> [preauth]"},
+		{"sshd[1]: Accepted publickey for jdoe from 192.0.2.7 port 22 ssh2",
+			"sshd[1]: Accepted publickey for jdoe from 192.0.2.7 port 22 ssh2"},
+		{"doas: jdoe ran command mysql -u root -pS3CR3T as root from /home/jdoe",
+			"doas: jdoe ran command mysql <redacted> as root from /home/jdoe"},
+		{"doas: obsdmcp ran command /sbin/pfctl -s rules as root from /",
+			"doas: obsdmcp ran command /sbin/pfctl <redacted> as root from /"},
+		{"doas: jdoe ran command ls as root from /tmp",
+			"doas: jdoe ran command ls as root from /tmp"},
+		{"doas: command not permitted for jdoe: cat /etc/master.passwd",
+			"doas: command not permitted for jdoe: cat <redacted>"},
+		{"doas: failed auth for jdoe", "doas: failed auth for jdoe"},
+	}
+	for _, c := range cases {
+		got, _ := AuthLine(c.in)
+		if got != c.want {
+			t.Errorf("AuthLine(%q)\n got %q\nwant %q", c.in, got, c.want)
+		}
+		// Idempotent: redacting twice changes nothing more.
+		if again, n := AuthLine(got); again != got || n != 0 {
+			t.Errorf("not idempotent: %q -> %q (%d)", got, again, n)
+		}
+	}
+}
+
+func TestURLQuery(t *testing.T) {
+	in := `example.org 192.0.2.7 - - [27/Nov/2026:10:00:00 +0000] "GET /reset?token=abc&u=1 HTTP/1.1" 200 12`
+	got, n := URLQuery(in)
+	want := `example.org 192.0.2.7 - - [27/Nov/2026:10:00:00 +0000] "GET /reset?<redacted> HTTP/1.1" 200 12`
+	if got != want || n != 1 {
+		t.Errorf("got %q (%d)", got, n)
+	}
+	if got, n := URLQuery(`"GET /index.html HTTP/1.1" 200`); n != 0 || got != `"GET /index.html HTTP/1.1" 200` {
+		t.Errorf("no query changed: %q", got)
+	}
+}
+
+// Non-ASCII before the key must not shift offsets (strings.ToLower can
+// change byte lengths, e.g. for U+0130).
+func TestAuthLineNonASCII(t *testing.T) {
+	in := "sshd[1]: \u0130\u0130\u0130 Invalid user p\u00e4ss from 192.0.2.7 port 1"
+	got, n := AuthLine(in)
+	want := "sshd[1]: \u0130\u0130\u0130 Invalid user <redacted> from 192.0.2.7 port 1"
+	if got != want || n != 1 {
+		t.Errorf("got %q (%d), want %q", got, n, want)
+	}
+}
+
+func FuzzAuthLine(f *testing.F) {
+	for _, s := range []string{"Invalid user x from y port 1", "a ran command b c as d from e",
+		"command not permitted for u: x y", "invalid user ", "\u0130invalid user \u0130 port "} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		got, _ := AuthLine(s) // must not panic
+		if again, n := AuthLine(got); n != 0 || again != got {
+			t.Errorf("not idempotent: %q -> %q -> %q", s, got, again)
+		}
+	})
+}
+
+func TestLineKeepsSSHDPasswordProse(t *testing.T) {
+	for _, l := range []string{
+		"sshd[1]: Failed password for root from 192.0.2.9 port 22 ssh2",
+		"sshd[1]: Accepted password for jdoe from 192.0.2.9 port 22 ssh2",
+	} {
+		if got, n := Line(l); got != l || n != 0 {
+			t.Errorf("Line(%q) = %q (%d)", l, got, n)
+		}
+	}
+	if got, _ := Line("password hunter2"); got != "password <redacted>" {
+		t.Errorf("value still redacted: %q", got)
+	}
+}

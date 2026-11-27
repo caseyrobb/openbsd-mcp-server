@@ -121,8 +121,30 @@ jobs:
         shell: cpa.sh {0} --sync-files none
         run: |
           set -e
-          feats=pf,confcheck
+          feats=pf,confcheck,logs
           if pgrep -qx ntpd; then feats=$feats,ntp; fi
+          if pgrep -qx smtpd; then feats=$feats,smtpd; fi
+          # Start daemons the VM can run with a minimal config. A daemon
+          # that does not start only skips its feature (with a warning).
+          iface=$(route -n get default | awk '/interface:/ {print $2}')
+          conf() { printf "$2" | sudo tee "$1" >/dev/null; sudo chmod 0600 "$1"; }
+          conf /etc/ospfd.conf "area 0.0.0.0 {\n\tinterface $iface { passive }\n}\n"
+          conf /etc/ospf6d.conf "area 0.0.0.0 {\n\tinterface $iface { passive }\n}\n"
+          conf /etc/relayd.conf 'relay "ssh" {\n\tlisten on 127.0.0.1 port 2222\n\tforward to 127.0.0.1 port 22\n}\n'
+          conf /etc/iked.conf ''
+          try() {
+            if sudo rcctl -f start "$1" >/dev/null 2>&1 && sleep 2 && pgrep -qx "$1"; then
+              feats=$feats,$2
+            else
+              echo "::warning::$1 did not start in the VM; $2 views not tested"
+            fi
+          }
+          try unwind unwind
+          try iked ipsec
+          try ospfd ospf
+          try ospf6d ospf6
+          try relayd relayd
+          echo "features under test: $feats"
           # rcctl ls started|failed run an rc.d check per service and take
           # over 30s on the emulated (non-KVM) arm64 VM. rcctl is a ksh
           # script, so the amd64 job covers it for both architectures.

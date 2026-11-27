@@ -301,14 +301,9 @@ func TestStatusToolSchemaEnum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string][]string{
-		"pf_status":       collect.PF.ViewNames(),
-		"unbound_status":  collect.Unbound.ViewNames(),
-		"bgp_status":      collect.BGP.ViewNames(),
-		"system_status":   collect.SystemViews.ViewNames(),
-		"network_status":  collect.NetworkViews.ViewNames(),
-		"ntp_status":      collect.NTP.ViewNames(),
-		"services_status": collect.Services.ViewNames(),
+	want := map[string][]string{}
+	for _, sub := range collect.Subsystems {
+		want[sub.Name+"_status"] = sub.ViewNames()
 	}
 	for _, tool := range res.Tools {
 		w, ok := want[tool.Name]
@@ -331,6 +326,9 @@ func TestStatusToolSchemaEnum(t *testing.T) {
 		}
 		if a := tool.Annotations; a == nil || !a.ReadOnlyHint {
 			t.Errorf("%s not annotated read-only", tool.Name)
+		}
+		if tool.Title == "" {
+			t.Errorf("%s has no title", tool.Name)
 		}
 	}
 	if len(want) != 0 {
@@ -389,5 +387,31 @@ func TestStatusToolRejectsBadViewBeforeRunning(t *testing.T) {
 	}
 	if len(rr.ids) != 0 {
 		t.Errorf("commands ran for rejected input: %v", rr.ids)
+	}
+}
+
+type fixedRunner string
+
+func (f fixedRunner) Run(context.Context, basecmd.ID) (execx.Result, error) {
+	return execx.Result{Stdout: string(f)}, nil
+}
+
+// Parsed data survives the SDK's output schema and JSON round trip.
+func TestStatusToolReturnsParsedData(t *testing.T) {
+	out := "Name    Mtu   Network     Address              Ipkts Ifail    Opkts Ofail Colls\n" +
+		"em0     1500  <Link>      00:11:22:33:44:55      100     2      300     4     0\n"
+	cs, _ := connectWith(t, Config{Runner: fixedRunner(out)})
+	res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: "network_status",
+		Arguments: map[string]any{"view": "interfaces"}})
+	if err != nil || res.IsError {
+		t.Fatalf("err=%v res=%s", err, callText(res))
+	}
+	raw, _ := json.Marshal(res.StructuredContent)
+	var got struct {
+		Data []collect.Interface `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &got); err != nil || len(got.Data) != 1 || got.Data[0].InFails != 2 ||
+		got.Data[0].OutFails != 4 {
+		t.Errorf("structured = %s (%v)", raw, err)
 	}
 }

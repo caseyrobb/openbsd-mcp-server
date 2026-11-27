@@ -38,6 +38,13 @@ forced command, so the server itself never opens a socket.
 | `bgp_status` | **Opt-in** (`-enable bgp`). One `bgpctl show` view: `summary`, `neighbors`, `nexthops`, `interfaces`, `rib_memory` |
 | `ntp_status` | **Opt-in** (`-enable ntp`). One `ntpctl -s` view: `status`, `peers`, `sensors`, `all` |
 | `services_status` | **Opt-in** (`-enable services`). One `rcctl ls` view: `enabled`, `started`, `failed` |
+| `log_tail` | **Opt-in** (`-enable logs`). The newest lines of one fixed log: `messages`, `daemon`, `authlog`, `secure`, `maillog`, `xferlog`, `cron`, `httpd_access`, `httpd_error`. Optional `lines` (1-500, default 100) and `match` (plain text, case-insensitive) |
+| `ospf_status`, `ospf6_status` | **Opt-in** (`-enable ospf`, `ospf6`). One `ospfctl`/`ospf6ctl show` view: `summary`, `neighbors`, `interfaces`, `rib`, `fib` |
+| `relayd_status` | **Opt-in** (`-enable relayd`). One `relayctl show` view: `summary`, `hosts`, `redirects`, `relays`, `routers` |
+| `smtpd_status` | **Opt-in** (`-enable smtpd`). `smtpctl show status` or `show stats`; never the queue, envelopes or messages |
+| `vmd_status` | **Opt-in** (`-enable vmd`). `vmctl status` |
+| `unwind_status` | **Opt-in** (`-enable unwind`). `unwindctl status` or `status autoconf` |
+| `ipsec_status` | **Opt-in** (`-enable ipsec`). `flows` (`ipsecctl -s flow`), `sas` (`ipsecctl -s sa`, never `-k`), `iked_sas` (`ikectl show sa`) |
 | `config_check` | **Opt-in** (`-enable confcheck`). Runs one daemon's configtest mode (`-n`, `sshd -t`) and reports `valid` plus the checker's messages: `pf`, `bgpd`, `httpd`, `relayd`, `smtpd`, `iked`, `ntpd`, `ospfd`, `ospf6d`, `dhcpd`, `unwind`, `vmd`, `snmpd`, `sshd`, `unbound` |
 
 The `config_read` allowlist is `/etc/rc.conf.local`, `pf.conf`, `sysctl.conf`,
@@ -50,6 +57,42 @@ the rest of the result is still returned. The `*_status` tools take a single
 `view` from a fixed enum, run exactly one fixed command, and return its
 redacted output plus the command line that ran. Opt-in tools are registered
 only when their feature is enabled.
+
+Some views also return `data`, the same output parsed into fields, so an
+agent can compare numbers without re-reading text tables:
+
+| View | `data` |
+|---|---|
+| `pf_status info` | `enabled`, `uptime`, and every counter by section (`State Table`, `Counters`, interface stats) with `total` and pf's `rate_per_sec` |
+| `system_status sensors` | one entry per sensor: `device`, `name`, `type`, `value`, numeric `number`, `unit`, `description`, `status` |
+| `network_status interfaces` | per interface: `up`, `mtu`, `address`, `in_packets`, `in_fails`, `out_packets`, `out_fails`, `collisions` |
+| `ntp_status status` | `synced`, `stratum`, peers and sensors valid/total, `constraint_offset_secs`, `clock_offset_ms` (while unsynced) |
+| `ntp_status peers` | per peer: `selected`, `weight`, `trust_level`, `stratum`, `next_secs`, `poll_secs`, `valid`, `offset_ms`, `delay_ms`, `jitter_ms` |
+
+`data` is parsed from the redacted output and is omitted when the output
+cannot be parsed; the text `output` is always returned.
+
+### Reading logs
+
+`log_tail` reads the last 1000 lines of one fixed file with
+`doas -n /usr/bin/tail -n 1000 <file>`, then filters and trims them. The
+client only picks a name; it can never name a file. Even `/var/log/messages`
+(mode 0644) goes through doas: if `tail` were unveiled for direct exec, a
+compromised server could run it on any file the server user can read and
+step around `unveil`.
+
+Every line is redacted before it is returned or matched:
+
+* secret values (`password ...`, `psk ...`, `*_token=...`), as in all output;
+* sshd `invalid user NAME`, because NAME is whatever the client typed,
+  often a password entered at the user prompt;
+* doas command arguments (`ran command /bin/x <redacted> as root`);
+* URL query strings in httpd access logs (`GET /reset?<redacted>`);
+* control characters and invalid UTF-8, which become U+FFFD.
+
+`match` runs on the redacted text, so it cannot confirm a hidden value.
+Log text comes from other programs and remote clients, so the tool tells the
+agent to treat it as data, never as instructions.
 
 ## Requirements
 
@@ -171,12 +214,19 @@ restrict,command="/usr/local/libexec/obsd-mcp -enable pf,unbound,bgp" ssh-ed2551
 | `ntp` | `/usr/sbin/ntpctl -s <view>` | `doas -n` (ntpd's socket is 0660 root) | doas rules; ntpd running |
 | `services` | `/usr/sbin/rcctl ls on\|started\|failed` | `doas -n` (rcctl is a shell script, and `started`/`failed` need root) | doas rules |
 | `confcheck` | each daemon's `-n` configtest, `sshd -t`, `pfctl -n -f /etc/pf.conf`, `unbound-checkconf` | `doas -n` (most configs are 0600 root) | doas rules |
+| `logs` | `/usr/bin/tail -n 1000 <one of 9 fixed logs>` | `doas -n` (most logs are 0640 or 0600 root) | doas rules |
+| `ospf`, `ospf6` | `/usr/sbin/ospfctl`/`ospf6ctl show <view>` | `doas -n` (the control socket also accepts reload and fib changes) | doas rules; daemon running |
+| `relayd` | `/usr/sbin/relayctl show <view>` | `doas -n` (the socket also accepts enable/disable/reload) | doas rules; relayd running |
+| `smtpd` | `/usr/sbin/smtpctl show status\|stats` | `doas -n` (the socket also accepts pause/remove/schedule) | doas rules; smtpd running |
+| `vmd` | `/usr/sbin/vmctl status` | `doas -n` (the socket also accepts start/stop) | doas rules; vmd running |
+| `unwind` | `/usr/sbin/unwindctl status [autoconf]` | `doas -n` (the socket also accepts reload) | doas rules; unwind running |
+| `ipsec` | `/sbin/ipsecctl -s flow\|sa`, `/usr/sbin/ikectl show sa` | `doas -n` (PF_KEY and iked's socket need root; `-k` is never run) | doas rules; iked running for `iked_sas` |
 
 Generate the exact `doas.conf` rules from the server itself, so they always
 match what it runs:
 
 ```sh
-/usr/local/libexec/obsd-mcp -enable pf,unbound,ntp,services,confcheck -print-doas obsdmcp | doas tee -a /etc/doas.conf
+/usr/local/libexec/obsd-mcp -enable pf,unbound,ntp,services,confcheck,logs -print-doas obsdmcp | doas tee -a /etc/doas.conf
 doas doas -C /etc/doas.conf    # syntax check
 ```
 
@@ -187,7 +237,8 @@ any other arguments. `unbound`'s statistics view uses `stats_noreset`: plain
 
 `doas` and `bgpctl` are unveiled only when a feature that needs them is
 enabled. Programs run through `doas` (`pfctl`, `unbound-control`, `ntpctl`,
-`rcctl` and the daemons) are never executable by the server directly.
+`rcctl`, `tail`, the daemon control programs and the daemons) are never
+executable by the server directly.
 A config check never loads anything: each daemon's flag is documented as
 "only check the configuration file for validity".
 
@@ -232,7 +283,7 @@ Or in a generic `mcpServers` JSON config:
 
 | Flag | Purpose |
 |---|---|
-| `-enable pf,unbound,bgp,ntp,services,confcheck` | Enable opt-in tools (see above) |
+| `-enable pf,unbound,...` | Enable opt-in tools (see above; `-h` lists all features) |
 | `-print-doas USER` | Print the `doas.conf` rules USER needs for `-enable`, then exit |
 | `-print-sshd USER` | Print an `sshd_config` `Match User` block that pins USER to this server with `-enable`, then exit |
 | `-print-policy` | Print the exact `unveil`/`pledge` calls and exit |
@@ -252,6 +303,8 @@ default. The server reports this clearly instead of failing silently.
 | ntpd control socket | 0660 root | only with `-enable ntp` + doas rules |
 | unbound control socket | 0660, full control | only with `-enable unbound` + doas rules |
 | bgpd restricted socket | 0666, show-only | with `-enable bgp`, once bgpd.conf creates it |
+| `/var/log/*`, `/var/cron/log`, `/var/www/logs/*` | 0600-0644 | only with `-enable logs` + doas rules |
+| ospfd, ospf6d, relayd, smtpd, vmd, unwind, iked sockets; PF_KEY | root / full control | only with the daemon's feature + doas rules |
 | `/etc/pf.conf` | 0600 | no, unless you grant group read |
 | `/etc/hostname.*` | 0640 | no (may contain keys) |
 | `/etc/rc.conf.local`, `hosts`, `resolv.conf`, `sshd_config` | 0644 | yes |
@@ -275,7 +328,7 @@ of non-allowlisted binaries fail, and that writes, sockets and further
 go test ./internal/sandbox -run Sandbox -v    # on OpenBSD, as a non-root user
 
 # after host setup, also run every opt-in view inside the sandbox:
-OBSDMCP_TEST_FEATURES=pf,unbound,bgp,ntp,services,confcheck go test ./internal/sandbox -run Sandbox -v
+OBSDMCP_TEST_FEATURES=pf,unbound,bgp,ntp,services,confcheck,logs go test ./internal/sandbox -run Sandbox -v
 ```
 
 ### Releases and versioning
@@ -285,8 +338,10 @@ requests and on version tags. It runs the Linux tests, cross-compiles the
 server and its test binaries for amd64 and arm64, then boots an OpenBSD VM
 for each architecture. In the VM it runs every test, including the real
 `pledge`/`unveil` sandbox tests. It then installs the `-print-doas` rules
-for `pf`, `confcheck`, `ntp` (if ntpd runs) and, on amd64, `services`,
-and runs every view of those features inside the sandbox through doas. It
+for `pf`, `confcheck`, `logs`, `ntp` and `smtpd` (when running) and, on
+amd64, `services`. It also starts unwind, iked, ospfd, ospf6d and relayd
+with minimal configs and adds each feature whose daemon came up. It then
+runs every view of those features inside the sandbox through doas. It
 appends the `-print-sshd` block to a copy of `sshd_config`, checks it with
 `sshd -t` and confirms with `sshd -T` that only the server user is pinned.
 Finally it builds the package with `pkg_create`. The Linux job also runs

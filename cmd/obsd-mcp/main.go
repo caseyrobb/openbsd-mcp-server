@@ -29,7 +29,8 @@ import (
 func main() {
 	printPolicy := flag.Bool("print-policy", false, "print the unveil/pledge policy and exit")
 	unsafeDev := flag.Bool("unsafe-dev", false, "allow running without pledge/unveil on non-OpenBSD (development only)")
-	enable := flag.String("enable", "", "comma-separated opt-in features: pf, unbound, bgp, ntp, services, confcheck")
+	enable := flag.String("enable", "", "comma-separated opt-in features: "+
+		strings.Join(basecmd.Enabled(allFeatures()).List(), ", "))
 	printDoas := flag.String("print-doas", "", "print the doas.conf rules USER needs for -enable, then exit")
 	printSSHD := flag.String("print-sshd", "", "print an sshd_config Match block that pins USER to this server with -enable, then exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -184,4 +185,12 @@ func serverPath() string {
 		}
 	}
 	return deploy.PackagePath
+}
+
+func allFeatures() map[basecmd.Feature]bool {
+	all := map[basecmd.Feature]bool{}
+	for _, f := range basecmd.Features {
+		all[f] = true
+	}
+	return all
 }

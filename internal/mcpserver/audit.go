@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -106,8 +107,13 @@ func formatArgs(raw json.RawMessage) string {
 			break
 		}
 		v := "<" + fmt.Sprintf("%T", m[k]) + ">"
-		if s, ok := m[k].(string); ok {
-			v = audit.Sanitize(s, 64)
+		switch x := m[k].(type) {
+		case string:
+			v = audit.Sanitize(x, 64)
+		case float64:
+			v = strconv.FormatFloat(x, 'g', 10, 64)
+		case bool:
+			v = strconv.FormatBool(x)
 		}
 		parts = append(parts, audit.Sanitize(k, 32)+"="+v)
 	}

@@ -37,10 +37,30 @@ const (
 	// FeatureConfCheck runs each daemon's configtest mode (-n, sshd -t)
 	// via doas, because the configs are mostly 0600 root.
 	FeatureConfCheck Feature = "confcheck"
+	// FeatureLogs reads the tail of fixed log files with tail(1) via doas.
+	// Even the 0644 logs go through doas: an unveiled tail could be made
+	// to read any file the server user can, bypassing unveil, while doas
+	// pins the exact file.
+	FeatureLogs Feature = "logs"
+	// Daemon status through each daemon's control program, via doas: their
+	// control sockets are root-only or also accept reload/stop commands,
+	// so the control programs are never unveiled for direct exec.
+	FeatureOSPF   Feature = "ospf"
+	FeatureOSPF6  Feature = "ospf6"
+	FeatureRelayd Feature = "relayd"
+	FeatureSMTPD  Feature = "smtpd"
+	FeatureVMD    Feature = "vmd"
+	FeatureUnwind Feature = "unwind"
+	// FeatureIPsec shows flows and SAs (ipsecctl -s, ikectl show sa).
+	// Never ipsecctl -k, which prints keying material.
+	FeatureIPsec Feature = "ipsec"
 )
 
 // Features lists every opt-in feature in display order.
-var Features = []Feature{FeaturePF, FeatureUnbound, FeatureBGP, FeatureNTP, FeatureServices, FeatureConfCheck}
+var Features = []Feature{
+	FeaturePF, FeatureUnbound, FeatureBGP, FeatureNTP, FeatureServices, FeatureConfCheck, FeatureLogs,
+	FeatureOSPF, FeatureOSPF6, FeatureRelayd, FeatureSMTPD, FeatureVMD, FeatureUnwind, FeatureIPsec,
+}
 
 // DoasPath is the only privilege wrapper the server may run.
 const DoasPath = "/usr/bin/doas"
@@ -120,6 +140,46 @@ const (
 	CheckSNMPD   ID = "check_snmpd"
 	CheckSSHD    ID = "check_sshd"
 	CheckUnbound ID = "check_unbound"
+
+	LogMessages    ID = "log_messages"
+	LogDaemon      ID = "log_daemon"
+	LogAuth        ID = "log_authlog"
+	LogSecure      ID = "log_secure"
+	LogMail        ID = "log_maillog"
+	LogXfer        ID = "log_xferlog"
+	LogCron        ID = "log_cron"
+	LogHTTPDAccess ID = "log_httpd_access"
+	LogHTTPDError  ID = "log_httpd_error"
+
+	OSPFSummary    ID = "ospf_summary"
+	OSPFNeighbors  ID = "ospf_neighbors"
+	OSPFInterfaces ID = "ospf_interfaces"
+	OSPFRIB        ID = "ospf_rib"
+	OSPFFIB        ID = "ospf_fib"
+
+	OSPF6Summary    ID = "ospf6_summary"
+	OSPF6Neighbors  ID = "ospf6_neighbors"
+	OSPF6Interfaces ID = "ospf6_interfaces"
+	OSPF6RIB        ID = "ospf6_rib"
+	OSPF6FIB        ID = "ospf6_fib"
+
+	RelaydSummary   ID = "relayd_summary"
+	RelaydHosts     ID = "relayd_hosts"
+	RelaydRedirects ID = "relayd_redirects"
+	RelaydRelays    ID = "relayd_relays"
+	RelaydRouters   ID = "relayd_routers"
+
+	SMTPDStatus ID = "smtpd_status"
+	SMTPDStats  ID = "smtpd_stats"
+
+	VMDStatus ID = "vmd_status"
+
+	UnwindStatus   ID = "unwind_status"
+	UnwindAutoconf ID = "unwind_autoconf"
+
+	IPsecFlows ID = "ipsec_flows"
+	IPsecSAs   ID = "ipsec_sas"
+	IKEDSAs    ID = "iked_sas"
 )
 
 // Spec is an immutable command invocation.
@@ -136,6 +196,9 @@ type Spec struct {
 	// Timeout, when longer than the runner's default, is this command's
 	// limit. rcctl runs a shell per service and needs it on slow hosts.
 	Timeout time.Duration
+	// MaxOutput, when larger than the runner's default, is this command's
+	// output cap. Log tails need room for their newest (last) lines.
+	MaxOutput int
 }
 
 // Argv returns the program to execve and its arguments.
@@ -200,6 +263,24 @@ func rcctlLs(what string) Spec {
 // registry tests pin the allowed shapes.
 func configtest(path string, args ...string) Spec {
 	return Spec{Path: path, Args: args, Feature: FeatureConfCheck, Doas: true}
+}
+
+// LogTailLines is how many lines each log read fetches. It is fixed
+// because doas pins arguments; collect filters and trims it further.
+const LogTailLines = "1000"
+
+// LogMaxOutput bounds a log read: 1000 lines of up to ~1 KiB.
+const LogMaxOutput = 1 << 20
+
+func logTail(file string) Spec {
+	return Spec{Path: "/usr/bin/tail", Args: []string{"-n", LogTailLines, file}, Feature: FeatureLogs,
+		Doas: true, MaxOutput: LogMaxOutput}
+}
+
+// ctl runs a daemon control program as root with a fixed show/status
+// argument list; the registry tests pin the allowed verbs per program.
+func ctl(f Feature, path string, args ...string) Spec {
+	return Spec{Path: path, Args: args, Feature: f, Doas: true}
 }
 
 func bgpctl(show ...string) Spec {
@@ -284,6 +365,54 @@ var registry = map[ID]Spec{
 	CheckSNMPD:   configtest("/usr/sbin/snmpd", "-n"),
 	CheckSSHD:    configtest("/usr/sbin/sshd", "-t"),
 	CheckUnbound: configtest("/usr/sbin/unbound-checkconf"),
+
+	// tail -n N <fixed file> only; the files are the logArgs allowlist.
+	LogMessages:    logTail("/var/log/messages"),
+	LogDaemon:      logTail("/var/log/daemon"),
+	LogAuth:        logTail("/var/log/authlog"),
+	LogSecure:      logTail("/var/log/secure"),
+	LogMail:        logTail("/var/log/maillog"),
+	LogXfer:        logTail("/var/log/xferlog"),
+	LogCron:        logTail("/var/cron/log"),
+	LogHTTPDAccess: logTail("/var/www/logs/access.log"),
+	LogHTTPDError:  logTail("/var/www/logs/error.log"),
+
+	// "show" only; never reload, fib couple/decouple/reload or log.
+	OSPFSummary:    ctl(FeatureOSPF, "/usr/sbin/ospfctl", "show", "summary"),
+	OSPFNeighbors:  ctl(FeatureOSPF, "/usr/sbin/ospfctl", "show", "neighbor"),
+	OSPFInterfaces: ctl(FeatureOSPF, "/usr/sbin/ospfctl", "show", "interfaces"),
+	OSPFRIB:        ctl(FeatureOSPF, "/usr/sbin/ospfctl", "show", "rib"),
+	OSPFFIB:        ctl(FeatureOSPF, "/usr/sbin/ospfctl", "show", "fib"),
+
+	OSPF6Summary:    ctl(FeatureOSPF6, "/usr/sbin/ospf6ctl", "show", "summary"),
+	OSPF6Neighbors:  ctl(FeatureOSPF6, "/usr/sbin/ospf6ctl", "show", "neighbor"),
+	OSPF6Interfaces: ctl(FeatureOSPF6, "/usr/sbin/ospf6ctl", "show", "interfaces"),
+	OSPF6RIB:        ctl(FeatureOSPF6, "/usr/sbin/ospf6ctl", "show", "rib"),
+	OSPF6FIB:        ctl(FeatureOSPF6, "/usr/sbin/ospf6ctl", "show", "fib"),
+
+	// "show" only; never host/redirect/table enable|disable, load,
+	// reload, poll or log. "show sessions" is left out (client addresses).
+	RelaydSummary:   ctl(FeatureRelayd, "/usr/sbin/relayctl", "show", "summary"),
+	RelaydHosts:     ctl(FeatureRelayd, "/usr/sbin/relayctl", "show", "hosts"),
+	RelaydRedirects: ctl(FeatureRelayd, "/usr/sbin/relayctl", "show", "redirects"),
+	RelaydRelays:    ctl(FeatureRelayd, "/usr/sbin/relayctl", "show", "relays"),
+	RelaydRouters:   ctl(FeatureRelayd, "/usr/sbin/relayctl", "show", "routers"),
+
+	// "show status|stats" only. The queue, envelope and message views
+	// expose mail addresses and contents and are never run.
+	SMTPDStatus: ctl(FeatureSMTPD, "/usr/sbin/smtpctl", "show", "status"),
+	SMTPDStats:  ctl(FeatureSMTPD, "/usr/sbin/smtpctl", "show", "stats"),
+
+	VMDStatus: ctl(FeatureVMD, "/usr/sbin/vmctl", "status"),
+
+	UnwindStatus:   ctl(FeatureUnwind, "/usr/sbin/unwindctl", "status"),
+	UnwindAutoconf: ctl(FeatureUnwind, "/usr/sbin/unwindctl", "status", "autoconf"),
+
+	// ipsecctl -s flow|sa without -k never prints keys; ikectl show sa
+	// prints SPIs, addresses and IDs only (iked ikev2_info_sa/csa).
+	IPsecFlows: ctl(FeatureIPsec, "/sbin/ipsecctl", "-s", "flow"),
+	IPsecSAs:   ctl(FeatureIPsec, "/sbin/ipsecctl", "-s", "sa"),
+	IKEDSAs:    ctl(FeatureIPsec, "/usr/sbin/ikectl", "show", "sa"),
 }
 
 // BaseDirs are the only directories registered binaries may live in.
@@ -295,6 +424,13 @@ var socketDirs = []string{"/var/run"}
 
 // configArgs are the only config files that may be named as an argument.
 var configArgs = map[string]bool{"/etc/pf.conf": true}
+
+// logArgs are the only log files that may be named as an argument.
+var logArgs = map[string]bool{
+	"/var/log/messages": true, "/var/log/daemon": true, "/var/log/authlog": true,
+	"/var/log/secure": true, "/var/log/maillog": true, "/var/log/xferlog": true,
+	"/var/cron/log": true, "/var/www/logs/access.log": true, "/var/www/logs/error.log": true,
+}
 
 // Enabled is the set of opt-in features the operator turned on.
 // The zero value enables none.
@@ -433,6 +569,9 @@ func validateSpec(s Spec) error {
 	if !inDirs(s.Path, BaseDirs) {
 		return fmt.Errorf("path %q is outside base system dirs %v", s.Path, BaseDirs)
 	}
+	if s.MaxOutput < 0 || s.MaxOutput > 4<<20 {
+		return fmt.Errorf("max output %d out of range", s.MaxOutput)
+	}
 	if s.Path == DoasPath {
 		return fmt.Errorf("use Doas: true instead of running %s directly", DoasPath)
 	}
@@ -452,8 +591,8 @@ func validateSpec(s Spec) error {
 		// Absolute-path arguments may only name a base program, a control
 		// socket under /var/run or an allowlisted config file.
 		if strings.HasPrefix(a, "/") &&
-			(path.Clean(a) != a || !(inDirs(a, BaseDirs) || inDirs(a, socketDirs) || configArgs[a])) {
-			return fmt.Errorf("arg %q is a path outside base program, socket or config allowlists", a)
+			(path.Clean(a) != a || !(inDirs(a, BaseDirs) || inDirs(a, socketDirs) || configArgs[a] || logArgs[a])) {
+			return fmt.Errorf("arg %q is a path outside base program, socket, config or log allowlists", a)
 		}
 	}
 	return nil

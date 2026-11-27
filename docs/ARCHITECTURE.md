@@ -84,12 +84,12 @@ users' full command lines can carry passwords. A registry test enforces it.
 
 ### Opt-in subsystems
 
-Enabled with `-enable pf,unbound,bgp,ntp,services,confcheck`. Each feature gates a group of registry
+Enabled with `-enable <feature,...>` (`basecmd.Features` is the list). Each feature gates a group of registry
 entries (`basecmd.Spec.Feature`). A disabled feature's commands are refused by
 `basecmd.Lookup`, so by `execx` too. Its programs are not unveiled, and its
 tool is not registered. Each tool takes one `view` from a fixed enum
-(`collect.PF`, `collect.Unbound`, `collect.BGP`). Every view maps to exactly
-one registry ID, and its output is redacted.
+(`collect.Subsystems`). Every view maps to exactly one registry ID, and its
+output is redacted.
 
 | Feature | Access path | Why |
 |---|---|---|
@@ -99,6 +99,13 @@ one registry ID, and its output is redacted.
 | `ntp` | `doas -n /usr/sbin/ntpctl -s <status\|peers\|Sensors\|all>` | ntpd's `control.c` only implements show requests, but chmods the socket 0660, so an unprivileged user cannot connect. |
 | `services` | `doas -n /usr/sbin/rcctl ls <on\|started\|failed>` | rcctl is a ksh script (see above), and `ls started\|failed` call `needs_root`. `ls failed` exits 1 when it lists anything; `collect` treats that as a result, not an error. rcctl runs an rc.d check per service, so these commands get a 30 s limit instead of the default 5 s (5 s timed out on the emulated arm64 CI VM). |
 | `confcheck` | `doas -n <daemon> -n` (`sshd -t`, `pfctl -n -f /etc/pf.conf`, `unbound-checkconf`) | Every daemon's man page documents the flag as "Configtest mode. Only check the configuration file for validity." The configs are mostly 0600 root. The `config_check` tool returns `valid=false` plus the checker's messages as a normal result; only a check that cannot run (doas refusal, exec failure) is a tool error. |
+| `logs` | `doas -n /usr/bin/tail -n 1000 <file>` | Most logs are 0640/0600 root. Even 0644 logs use doas: an unveiled `tail` would read any file the server user can, around unveil, while doas pins the file. See "Logs" below. |
+| `ospf`, `ospf6` | `doas -n /usr/sbin/ospf{,6}ctl show <summary\|neighbor\|interfaces\|rib\|fib>` | The control socket is root-only and also takes `reload`, `fib couple/decouple/reload` and `log`. |
+| `relayd` | `doas -n /usr/sbin/relayctl show <summary\|hosts\|redirects\|relays\|routers>` | The socket also takes enable/disable, `load`, `reload`. `show sessions` (client addresses) is left out. |
+| `smtpd` | `doas -n /usr/sbin/smtpctl show <status\|stats>` | The socket also takes pause/resume/remove/schedule. `show queue`, `envelope` and `message` expose addresses and mail and are never run. |
+| `vmd` | `doas -n /usr/sbin/vmctl status` | The socket also takes start/stop/pause. |
+| `unwind` | `doas -n /usr/sbin/unwindctl status [autoconf]` | The socket also takes `reload` and `log`. |
+| `ipsec` | `doas -n /sbin/ipsecctl -s <flow\|sa>`, `doas -n /usr/sbin/ikectl show sa` | PF_KEY and iked's socket need root. `ipsecctl -k` prints keying material and is forbidden by test; `ikectl show sa` prints SPIs, addresses and IDs only (`ikev2_info_sa`/`ikev2_info_csa` in iked). |
 
 Registry tests enforce the read-only argument shape:
 
@@ -110,11 +117,17 @@ Registry tests enforce the read-only argument shape:
 * Every confcheck entry must be exactly `-n`, `sshd -t`,
   `pfctl -n -f /etc/pf.conf` or no arguments (`unbound-checkconf`), so no
   entry can drift into loading a configuration.
+* Daemon control programs (`ospfctl`, `ospf6ctl`, `relayctl`, `smtpctl`,
+  `vmctl`, `unwindctl`, `ipsecctl`, `ikectl`) are limited to a per-program
+  set of `show`/`status` argument lists, always via doas, and never `-k`.
+* Log reads are exactly `tail -n 1000 <file>`, each file registered once,
+  and only from the log allowlist.
 * Commands without a feature never use doas.
 * Arguments may not contain whitespace, so every argument stays one doas.conf
   token.
 * An absolute-path argument must name a base program, a socket under
-  `/var/run` or an allowlisted config file (`/etc/pf.conf`).
+  `/var/run`, an allowlisted config file (`/etc/pf.conf`) or an allowlisted
+  log file.
 
 `Spec.Path` is always the real program. `Spec.Doas` adds the
 `/usr/bin/doas -n` wrapper in `Spec.Argv()`, which is used both for exec and
@@ -188,6 +201,37 @@ The confread denylist refuses these even if they are allowlisted:
 `/usr/local /etc/pkg /var/db/pkg /etc/ssl/private /etc/iked /etc/isakmpd /root
 /home`. `sandbox.NewPolicy` separately refuses to unveil the same secret
 stores and package trees.
+
+## Logs
+
+`log_tail` (feature `logs`) maps a client-chosen name to one registry ID,
+`doas -n /usr/bin/tail -n 1000 <file>`. The 1000 is fixed because doas pins
+arguments; `collect.LogTail` then filters and trims to `lines` (1-500). The
+command's output cap is raised to 1 MiB (`Spec.MaxOutput`) so the newest
+lines are not cut off; the bounded buffer keeps the first bytes, and tail
+puts the newest lines last.
+
+Each line goes through, in order: control-character and UTF-8 cleanup
+(U+FFFD), `redact.Line` (secret values), then `redact.AuthLine` (sshd
+`invalid user NAME`, doas command arguments) or, for httpd access logs,
+`redact.URLQuery`. `match` is applied to the redacted line, so a client cannot
+learn a hidden value by probing for it. `redact.Line` treats `password for`
+as prose, so sshd's `Failed password for root` keeps its user name.
+`AuthLine` is fuzzed for panics and idempotence.
+
+Log text is attacker-influenced (remote clients choose user names, URLs and
+user agents). The tool description tells the agent to treat it as data.
+
+## Structured data
+
+`collect.parsers` maps a few registry IDs to parsers that run on the
+**redacted** output and fill `StatusResult.Data`: `pfctl -s info`,
+`sysctl hw.sensors`, `netstat -in`, `ntpctl -s status` and `-s peers`. The
+formats come from the printing code (`pfctl_parser.c print_status`,
+`sysctl.c print_sensor`, netstat `if.c intpr`, ntpd `show_status_msg` and
+`show_peer_msg`), and the tests build their samples with the same printf
+formats. A parser never fails a call: if nothing parses, `data` is omitted
+and the text `output` stands alone.
 
 ## Audit log and limits
 

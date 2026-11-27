@@ -112,7 +112,8 @@ func TestBinariesPerFeature(t *testing.T) {
 		{nil, nil, []string{DoasPath, "/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/bgpctl",
 			"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/bin/ksh", "/bin/sh"}},
 		{all, []string{DoasPath, "/usr/sbin/bgpctl", "/bin/ps", "/usr/bin/netstat"},
-			[]string{"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/usr/sbin/bgpd", "/usr/sbin/sshd", "/bin/ksh", "/bin/sh"}},
+			append([]string{"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/usr/sbin/bgpd", "/usr/sbin/sshd", "/bin/ksh", "/bin/sh",
+				"/usr/bin/tail"}, ctlPrograms...)},
 		{Enabled{FeaturePF: true}, []string{DoasPath}, []string{"/sbin/pfctl", "/usr/sbin/bgpctl"}},
 		{Enabled{FeatureUnbound: true}, []string{DoasPath}, []string{"/usr/sbin/unbound-control", "/usr/sbin/bgpctl"}},
 		{Enabled{FeatureBGP: true}, []string{"/usr/sbin/bgpctl"}, []string{DoasPath}},
@@ -338,7 +339,7 @@ func TestParseFeatures(t *testing.T) {
 	if en, err := ParseFeatures(""); err != nil || len(en) != 0 {
 		t.Fatalf("empty: %v, %v", en, err)
 	}
-	for _, bad := range []string{"pf,ipsec", "PF", "all", "pf;unbound"} {
+	for _, bad := range []string{"pf,isakmpd", "PF", "all", "pf;unbound"} {
 		if _, err := ParseFeatures(bad); err == nil {
 			t.Errorf("ParseFeatures(%q) accepted", bad)
 		}
@@ -359,5 +360,104 @@ func TestSpecTimeouts(t *testing.T) {
 		if s.Timeout != 0 && s.Path != "/usr/sbin/rcctl" {
 			t.Errorf("%s: unexpected custom timeout %s", id, s.Timeout)
 		}
+	}
+}
+
+// ctlPrograms are daemon control programs that also accept reload, stop or
+// flush commands. They only ever run through doas with pinned arguments.
+var ctlPrograms = []string{
+	"/usr/sbin/ospfctl", "/usr/sbin/ospf6ctl", "/usr/sbin/relayctl", "/usr/sbin/smtpctl",
+	"/usr/sbin/vmctl", "/usr/sbin/unwindctl", "/sbin/ipsecctl", "/usr/sbin/ikectl",
+}
+
+// TestDaemonCtlOnlyShows pins every daemon control command to a documented
+// read-only verb, through doas, under its own feature.
+func TestDaemonCtlOnlyShows(t *testing.T) {
+	allowed := map[string]struct {
+		f    Feature
+		args map[string]bool
+	}{
+		"/usr/sbin/ospfctl": {FeatureOSPF, map[string]bool{"show summary": true, "show neighbor": true,
+			"show interfaces": true, "show rib": true, "show fib": true}},
+		"/usr/sbin/ospf6ctl": {FeatureOSPF6, map[string]bool{"show summary": true, "show neighbor": true,
+			"show interfaces": true, "show rib": true, "show fib": true}},
+		"/usr/sbin/relayctl": {FeatureRelayd, map[string]bool{"show summary": true, "show hosts": true,
+			"show redirects": true, "show relays": true, "show routers": true}},
+		"/usr/sbin/smtpctl":   {FeatureSMTPD, map[string]bool{"show status": true, "show stats": true}},
+		"/usr/sbin/vmctl":     {FeatureVMD, map[string]bool{"status": true}},
+		"/usr/sbin/unwindctl": {FeatureUnwind, map[string]bool{"status": true, "status autoconf": true}},
+		"/sbin/ipsecctl":      {FeatureIPsec, map[string]bool{"-s flow": true, "-s sa": true}},
+		"/usr/sbin/ikectl":    {FeatureIPsec, map[string]bool{"show sa": true}},
+	}
+	seen := map[string]int{}
+	for id, s := range registry {
+		a, ok := allowed[s.Path]
+		if !ok {
+			continue
+		}
+		seen[s.Path]++
+		args := strings.Join(s.Args, " ")
+		if !s.Doas || s.Feature != a.f || !a.args[args] {
+			t.Errorf("%s: %s %q (doas=%v feature=%s) is not an allowed read-only invocation", id, s.Path, args, s.Doas, s.Feature)
+		}
+		for _, x := range s.Args {
+			if x == "-k" || strings.HasPrefix(x, "-") && strings.Contains(x, "k") {
+				t.Errorf("%s: %s must never get -k (prints keys)", id, s.Path)
+			}
+		}
+	}
+	for _, p := range ctlPrograms {
+		if seen[p] == 0 {
+			t.Errorf("no registered commands for %s", p)
+		}
+	}
+}
+
+// TestLogTailShapes pins log reads to tail -n LogTailLines <allowlisted file>.
+func TestLogTailShapes(t *testing.T) {
+	files := map[string]bool{}
+	for id, s := range registry {
+		if s.Path != "/usr/bin/tail" && s.Feature != FeatureLogs {
+			continue
+		}
+		if s.Path != "/usr/bin/tail" || s.Feature != FeatureLogs || !s.Doas || len(s.Args) != 3 ||
+			s.Args[0] != "-n" || s.Args[1] != LogTailLines || !logArgs[s.Args[2]] {
+			t.Errorf("%s: %+v is not doas tail -n %s <log file>", id, s, LogTailLines)
+			continue
+		}
+		if files[s.Args[2]] {
+			t.Errorf("%s: %s registered twice", id, s.Args[2])
+		}
+		files[s.Args[2]] = true
+	}
+	if len(files) != len(logArgs) {
+		t.Errorf("log files registered %d, allowlisted %d", len(files), len(logArgs))
+	}
+	for f := range logArgs {
+		for _, bad := range []string{"master.passwd", "spwd", ".ssh", "ssl/private", ".key"} {
+			if strings.Contains(f, bad) {
+				t.Errorf("log allowlist contains %s", f)
+			}
+		}
+	}
+}
+
+func TestValidateRejectsOtherLogPaths(t *testing.T) {
+	for _, f := range []string{"/var/log/../../etc/master.passwd", "/etc/master.passwd", "/var/log/pflog",
+		"/var/log/wtmp", "/var/www/logs/../../etc/spwd.db"} {
+		if err := validateSpec(Spec{Path: "/usr/bin/tail", Args: []string{"-n", "10", f}}); err == nil {
+			t.Errorf("tail %s accepted", f)
+		}
+	}
+}
+
+func TestMaxOutputOnlyForLogs(t *testing.T) {
+	for id, s := range registry {
+		if s.MaxOutput != 0 && s.Feature != FeatureLogs {
+			t.Errorf("%s: unexpected MaxOutput %d", id, s.MaxOutput)
+		}
+	}
+	if validateSpec(Spec{Path: "/bin/df", MaxOutput: 64 << 20}) == nil {
+		t.Error("huge MaxOutput accepted")
 	}
 }

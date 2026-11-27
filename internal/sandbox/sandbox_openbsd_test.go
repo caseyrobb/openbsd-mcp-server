@@ -258,9 +258,27 @@ func probeFeatures(en basecmd.Enabled) int {
 			}
 		}
 	}
+	// Logs: a log that was never written (no ftpd, no httpd) is absent;
+	// any other failure, including a doas refusal, counts.
+	if en[basecmd.FeatureLogs] {
+		for _, l := range collect.Logs {
+			step("log_tail %s", l.Name)
+			res, err := collect.LogTail(context.Background(), r, l.Name, 5, "")
+			switch {
+			case err != nil && strings.Contains(err.Error(), "No such file or directory"):
+				fmt.Printf("note: log_tail %s: absent\n", l.Name)
+			case err != nil:
+				fails = append(fails, fmt.Sprintf("log_tail/%s: %v", l.Name, err))
+			default:
+				fmt.Printf("note: log_tail %s: scanned=%d redactions=%d\n", l.Name, res.Scanned, res.Redactions)
+			}
+		}
+	}
 	// The doas targets are never directly executable: only doas is unveiled.
 	for _, bin := range []string{"/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/ntpctl",
-		"/usr/sbin/rcctl", "/bin/ksh", "/usr/sbin/sshd", "/usr/sbin/bgpd"} {
+		"/usr/sbin/rcctl", "/bin/ksh", "/usr/sbin/sshd", "/usr/sbin/bgpd", "/usr/bin/tail",
+		"/usr/sbin/ospfctl", "/usr/sbin/ospf6ctl", "/usr/sbin/relayctl", "/usr/sbin/smtpctl",
+		"/usr/sbin/vmctl", "/usr/sbin/unwindctl", "/sbin/ipsecctl", "/usr/sbin/ikectl"} {
 		step("direct exec %s", bin)
 		var out bytes.Buffer
 		cmd := exec.Command(bin)

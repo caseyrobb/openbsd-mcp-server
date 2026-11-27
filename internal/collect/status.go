@@ -127,8 +127,85 @@ var (
 	}
 )
 
+// doasHint is the setup hint for a doas-run control program.
+func doasHint(prog string, f basecmd.Feature, daemon string) string {
+	return prog + " runs via 'doas -n' and needs " + daemon + " running; " +
+		"check /etc/doas.conf against: obsd-mcp -enable " + string(f) + " -print-doas <user>"
+}
+
+// Opt-in daemon status through each daemon's control program, via doas.
+var (
+	OSPF = Subsystem{
+		Name: "ospf", Feature: basecmd.FeatureOSPF,
+		Views: []View{
+			{"summary", basecmd.OSPFSummary, "ospfctl show summary: router ID, areas, SPF state"},
+			{"neighbors", basecmd.OSPFNeighbors, "ospfctl show neighbor: neighbor state and dead time"},
+			{"interfaces", basecmd.OSPFInterfaces, "ospfctl show interfaces: OSPF interfaces, state, cost"},
+			{"rib", basecmd.OSPFRIB, "ospfctl show rib: ospfd's routing table"},
+			{"fib", basecmd.OSPFFIB, "ospfctl show fib: kernel forwarding table as ospfd sees it"},
+		},
+		Hint: doasHint("ospfctl", basecmd.FeatureOSPF, "ospfd"),
+	}
+	OSPF6 = Subsystem{
+		Name: "ospf6", Feature: basecmd.FeatureOSPF6,
+		Views: []View{
+			{"summary", basecmd.OSPF6Summary, "ospf6ctl show summary: router ID, areas, SPF state"},
+			{"neighbors", basecmd.OSPF6Neighbors, "ospf6ctl show neighbor: neighbor state and dead time"},
+			{"interfaces", basecmd.OSPF6Interfaces, "ospf6ctl show interfaces: OSPFv3 interfaces, state, cost"},
+			{"rib", basecmd.OSPF6RIB, "ospf6ctl show rib: ospf6d's routing table"},
+			{"fib", basecmd.OSPF6FIB, "ospf6ctl show fib: kernel forwarding table as ospf6d sees it"},
+		},
+		Hint: doasHint("ospf6ctl", basecmd.FeatureOSPF6, "ospf6d"),
+	}
+	Relayd = Subsystem{
+		Name: "relayd", Feature: basecmd.FeatureRelayd,
+		Views: []View{
+			{"summary", basecmd.RelaydSummary, "relayctl show summary: redirects, relays, tables, hosts"},
+			{"hosts", basecmd.RelaydHosts, "relayctl show hosts: host check status"},
+			{"redirects", basecmd.RelaydRedirects, "relayctl show redirects: redirect state and counters"},
+			{"relays", basecmd.RelaydRelays, "relayctl show relays: relay state and counters"},
+			{"routers", basecmd.RelaydRouters, "relayctl show routers: router state"},
+		},
+		Hint: doasHint("relayctl", basecmd.FeatureRelayd, "relayd"),
+	}
+	SMTPD = Subsystem{
+		Name: "smtpd", Feature: basecmd.FeatureSMTPD,
+		Views: []View{
+			{"status", basecmd.SMTPDStatus, "smtpctl show status: whether MDA, MTA and SMTP are running or paused"},
+			{"stats", basecmd.SMTPDStats, "smtpctl show stats: counters (no queue, envelope or message contents)"},
+		},
+		Hint: doasHint("smtpctl", basecmd.FeatureSMTPD, "smtpd"),
+	}
+	VMD = Subsystem{
+		Name: "vmd", Feature: basecmd.FeatureVMD,
+		Views: []View{
+			{"status", basecmd.VMDStatus, "vmctl status: VMs, state, CPUs, memory, owner"},
+		},
+		Hint: doasHint("vmctl", basecmd.FeatureVMD, "vmd"),
+	}
+	Unwind = Subsystem{
+		Name: "unwind", Feature: basecmd.FeatureUnwind,
+		Views: []View{
+			{"status", basecmd.UnwindStatus, "unwindctl status: resolver types, their state and the one in use"},
+			{"autoconf", basecmd.UnwindAutoconf, "unwindctl status autoconf: nameservers learned from dhcpleased/slaacd"},
+		},
+		Hint: doasHint("unwindctl", basecmd.FeatureUnwind, "unwind"),
+	}
+	IPsec = Subsystem{
+		Name: "ipsec", Feature: basecmd.FeatureIPsec,
+		Views: []View{
+			{"flows", basecmd.IPsecFlows, "ipsecctl -s flow: kernel IPsec flows (SPD)"},
+			{"sas", basecmd.IPsecSAs, "ipsecctl -s sa: kernel SAs, without keys (never -k)"},
+			{"iked_sas", basecmd.IKEDSAs, "ikectl show sa: iked IKE and child SAs (SPIs, peers, IDs; no keys)"},
+		},
+		Hint: "ipsecctl and ikectl run via 'doas -n' (iked_sas needs iked running); " +
+			"check /etc/doas.conf against: obsd-mcp -enable ipsec -print-doas <user>",
+	}
+)
+
 // Subsystems lists every *_status tool, always-available ones first.
-var Subsystems = []Subsystem{SystemViews, NetworkViews, PF, Unbound, BGP, NTP, Services}
+var Subsystems = []Subsystem{SystemViews, NetworkViews, PF, Unbound, BGP, NTP, Services,
+	OSPF, OSPF6, Relayd, SMTPD, VMD, Unwind, IPsec}
 
 // ViewNames returns the view names in order (the schema enum).
 func (s Subsystem) ViewNames() []string {
@@ -153,6 +230,10 @@ type StatusResult struct {
 	Redactions int `json:"redactions,omitempty"`
 	// ExitStatus is set when a NonZeroOK view exited non-zero.
 	ExitStatus int `json:"exit_status,omitempty"`
+	// Data is the output parsed into fields, for the views that have a
+	// parser (pf info, sensors, network interfaces, ntp status and peers).
+	// It is derived from Output, so it never holds anything Output lacks.
+	Data any `json:"data,omitempty" jsonschema:"parsed fields for some views; the same information as output"`
 }
 
 // Status runs one view. A failing command is returned as an error (the tool
@@ -199,5 +280,14 @@ func Status(ctx context.Context, r execx.Runner, s Subsystem, view string) (Stat
 		Truncated:  res.Truncated,
 		Redactions: red.Count,
 		ExitStatus: res.ExitCode,
+		Data:       parse(v.ID, red.Text),
 	}, nil
+}
+
+// parse runs v's parser, if any, on the redacted output.
+func parse(id basecmd.ID, text string) any {
+	if p := parsers[id]; p != nil {
+		return p(text)
+	}
+	return nil
 }
