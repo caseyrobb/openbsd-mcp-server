@@ -103,7 +103,7 @@ jobs:
         run: sh scripts/build.sh "$VERSION" "${{ matrix.goarch }}" "dist/${{ matrix.goarch }}"
 
       - name: Start OpenBSD ${{ env.OPENBSD_VERSION }} VM (${{ matrix.vm_arch }})
-        uses: cross-platform-actions/action@f4288ce47b91d3f0f4f05a29824393beda26ac3c # v1.8.0
+        uses: cross-platform-actions/action@30cde56b87a128507bebea9531205087890ee360 # v1.8.0
         with:
           operating_system: openbsd
           architecture: ${{ matrix.vm_arch }}
