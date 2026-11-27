@@ -320,6 +320,17 @@ func ParseFeatures(s string) (Enabled, error) {
 	return en, nil
 }
 
+// List returns the enabled features in canonical (Features) order.
+func (en Enabled) List() []string {
+	var out []string
+	for _, f := range Features {
+		if en[f] {
+			out = append(out, string(f))
+		}
+	}
+	return out
+}
+
 func featureList() string {
 	var s []string
 	for _, f := range Features {
@@ -380,6 +391,10 @@ func Binaries(en Enabled) []string {
 // validUser matches a conservative OpenBSD login name, so a generated
 // doas.conf line cannot be malformed or carry extra tokens.
 var validUser = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// ValidUser reports whether name is a conservative OpenBSD login name, safe
+// to place in generated doas.conf and sshd_config lines.
+func ValidUser(name string) bool { return validUser.MatchString(name) }
 
 // DoasRules returns the exact doas.conf(5) lines that the enabled features
 // need for user, sorted. Each rule pins the full argument list, so doas

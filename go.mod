@@ -2,6 +2,8 @@ module github.com/caseyrobb/openbsd-mcp-server
 
 go 1.26.0
 
+toolchain go1.26.11
+
 require (
 	github.com/google/jsonschema-go v0.4.3
 	github.com/modelcontextprotocol/go-sdk v1.8.0

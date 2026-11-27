@@ -3,7 +3,9 @@
 # - Every push to main: tests, then OpenBSD packages for amd64 and arm64,
 #   published to the rolling "dev" prerelease (replaced on each push).
 # - A pushed tag vMAJOR.MINOR.PATCH[-(alpha|beta|rc).N]: the same build,
-#   published as a GitHub release for that tag.
+#   published as a GitHub release for that tag, with SHA256 signed by
+#   signify(1). The signing key is only available to tag builds, through
+#   the "release" environment (see README, "Release signing").
 # - Pull requests: tests and packages only, nothing is published.
 #
 # Versions come from git tags; see scripts/version.sh.
@@ -69,6 +71,12 @@ jobs:
           GOOS=openbsd GOARCH=arm64 go vet ./...
       - name: go test
         run: go test -race ./...
+      - name: govulncheck (Linux and the OpenBSD release targets)
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.9.0
+          govulncheck ./...
+          GOOS=openbsd GOARCH=amd64 govulncheck ./...
+          GOOS=openbsd GOARCH=arm64 govulncheck ./...
 
   package:
     needs: [version, test]
@@ -127,6 +135,24 @@ jobs:
           cd internal/sandbox
           OBSDMCP_TEST_FEATURES=$feats "$bin/tests/sandbox.test" -test.run SandboxFeatures -test.v
 
+      - name: Check the -print-sshd block with the real sshd
+        shell: cpa.sh {0} --sync-files none
+        run: |
+          set -e
+          me=$(id -un)
+          cfg=$(mktemp)
+          cat /etc/ssh/sshd_config > "$cfg"
+          ./dist/${{ matrix.goarch }}/obsd-mcp -enable pf,confcheck -print-sshd "$me" >> "$cfg"
+          sudo sshd -t -f "$cfg"
+          eff() { sudo sshd -T -f "$cfg" -C "user=$1,host=localhost,addr=127.0.0.1"; }
+          eff "$me" | tee /dev/stderr | grep -q "^forcecommand .*/obsd-mcp -enable pf,confcheck$"
+          for want in "permittty no" "disableforwarding yes" "authenticationmethods publickey" \
+              "permittunnel no" "permituserrc no"; do
+            eff "$me" | grep -qx "$want" || { echo "missing: $want"; exit 1; }
+          done
+          # "Match all" ends the block: other users keep the global settings.
+          eff nobody | grep -qx "forcecommand none"
+
       - name: Build package with pkg_create
         shell: cpa.sh {0} --sync-files vm-to-runner --environment-variables PKG_VERSION
         run: sh scripts/mkpkg.sh "$PKG_VERSION" dist/${{ matrix.goarch }}/obsd-mcp dist/pkg
@@ -138,9 +164,11 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref_type == 'tag'
     needs: [version, package]
     runs-on: ubuntu-latest
+    # Holds SIGNIFY_SECRET_KEY; restrict it to v* tags in the repo settings.
+    environment: release
     permissions:
       contents: write
     env:
@@ -150,27 +178,67 @@ jobs:
       TAG: ${{ needs.version.outputs.release_tag }}
       PRERELEASE: ${{ needs.version.outputs.prerelease }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false # only the public key is used
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: pkg-*
           merge-multiple: true
           path: dist
-      - name: Checksums (verify on OpenBSD with sha256 -C SHA256 <file>)
+      - name: Checksums
         working-directory: dist
         run: |
           sha256sum --tag *.tgz > SHA256
           cat SHA256
+      - name: Sign SHA256 with signify (verify with signify -C)
+        env:
+          SIGNIFY_SECRET_KEY: ${{ secrets.SIGNIFY_SECRET_KEY }}
+        run: |
+          if [ -z "$SIGNIFY_SECRET_KEY" ] || [ ! -f signify/obsd-mcp.pub ]; then
+            echo "::error::release signing needs signify/obsd-mcp.pub and the SIGNIFY_SECRET_KEY secret"
+            exit 1
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq signify-openbsd
+          key=$RUNNER_TEMP/obsd-mcp.sec
+          trap 'rm -f "$key"' EXIT
+          (umask 077; printf '%s\n' "$SIGNIFY_SECRET_KEY" > "$key")
+          cd dist
+          signify-openbsd -S -e -s "$key" -m SHA256 -x SHA256.sig
+          # Fails the release if the secret does not match the committed key.
+          signify-openbsd -C -p ../signify/obsd-mcp.pub -x SHA256.sig *.tgz
       - name: Publish tagged release
-        if: github.ref_type == 'tag'
         run: |
           flags=""
           [ "$PRERELEASE" = true ] && flags="--prerelease"
           gh release create "$TAG" dist/* --verify-tag $flags \
             --title "obsd-mcp $VERSION" --generate-notes
+
+  dev:
+    if: github.event_name == 'push' && github.ref_type == 'branch'
+    needs: [version, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: pkg-*
+          merge-multiple: true
+          path: dist
+      - name: Checksums (dev builds are not signed)
+        working-directory: dist
+        run: |
+          sha256sum --tag *.tgz > SHA256
+          cat SHA256
       - name: Publish rolling dev prerelease
-        if: github.ref_type == 'branch'
         run: |
           gh release delete dev --cleanup-tag --yes || true
           gh release create dev dist/* --prerelease --target "$GITHUB_SHA" \
             --title "Development build $VERSION" \
-            --notes "Automated build of main at $GITHUB_SHA ($VERSION). Replaced on every push; not a stable release."
+            --notes "Automated build of main at $GITHUB_SHA ($VERSION). Replaced on every push; not a stable release, not signed."

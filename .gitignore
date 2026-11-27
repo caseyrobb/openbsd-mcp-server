@@ -2,3 +2,7 @@
 *.test
 *.out
 /dist/
+obsd-mcp.sec
+
+# signify secret keys must never be committed
+*.sec

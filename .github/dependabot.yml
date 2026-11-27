@@ -1,0 +1,12 @@
+# Weekly update PRs for the Go module and the SHA-pinned actions. Each PR
+# runs the full release workflow (tests, govulncheck, OpenBSD VM) unpublished.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

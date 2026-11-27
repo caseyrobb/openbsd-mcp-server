@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/caseyrobb/openbsd-mcp-server/internal/audit"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/basecmd"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/confread"
+	"github.com/caseyrobb/openbsd-mcp-server/internal/deploy"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/execx"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/mcpserver"
 	"github.com/caseyrobb/openbsd-mcp-server/internal/sandbox"
@@ -29,6 +31,7 @@ func main() {
 	unsafeDev := flag.Bool("unsafe-dev", false, "allow running without pledge/unveil on non-OpenBSD (development only)")
 	enable := flag.String("enable", "", "comma-separated opt-in features: pf, unbound, bgp, ntp, services, confcheck")
 	printDoas := flag.String("print-doas", "", "print the doas.conf rules USER needs for -enable, then exit")
+	printSSHD := flag.String("print-sshd", "", "print an sshd_config Match block that pins USER to this server with -enable, then exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -64,6 +67,18 @@ func main() {
 		for _, r := range rules {
 			fmt.Println(r)
 		}
+		return
+	}
+	if *printSSHD != "" {
+		bin := serverPath()
+		block, err := deploy.SSHDConfig(*printSSHD, bin, enabled)
+		if err != nil {
+			log.Fatalf("-print-sshd: %v", err)
+		}
+		if w := ownerWarning(bin); w != "" {
+			log.Printf("-print-sshd: WARNING: %s", w)
+		}
+		fmt.Print(block)
 		return
 	}
 
@@ -115,7 +130,7 @@ func main() {
 
 	start := time.Now()
 	auditLog.Log(audit.Info, fmt.Sprintf("event=session_start version=%s uid=%d features=%s ssh_client=%s",
-		audit.Sanitize(mcpserver.Version, 64), os.Getuid(), audit.Sanitize(featureList(enabled), 128),
+		audit.Sanitize(mcpserver.Version, 64), os.Getuid(), audit.Sanitize(strings.Join(enabled.List(), ","), 128),
 		audit.Sanitize(sshClient(), 64)))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -137,12 +152,36 @@ func sshClient() string {
 	return ""
 }
 
-func featureList(en basecmd.Enabled) string {
-	var out []string
-	for _, f := range basecmd.Features {
-		if en[f] {
-			out = append(out, string(f))
+// ownerWarning flags a server binary that someone other than root could
+// replace: whoever can write it controls what the forced command runs.
+func ownerWarning(bin string) string {
+	fi, err := os.Stat(bin)
+	if err != nil {
+		return fmt.Sprintf("%s: %v (install the server there before reloading sshd)", bin, err)
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if ok && st.Uid != 0 {
+		return fmt.Sprintf("%s is not owned by root; install it root-owned, e.g. %s", bin, deploy.PackagePath)
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Sprintf("%s is group- or world-writable", bin)
+	}
+	return ""
+}
+
+// serverPath is this binary's absolute path for -print-sshd, falling back to
+// the package location when it cannot be determined (OpenBSD derives it
+// from argv[0], which is relative when run through $PATH).
+func serverPath() string {
+	p, err := os.Executable()
+	if err == nil {
+		p, err = filepath.EvalSymlinks(p)
+	}
+	if err == nil {
+		var fi os.FileInfo
+		if fi, err = os.Stat(p); err == nil && fi.Mode().IsRegular() && filepath.IsAbs(p) {
+			return p
 		}
 	}
-	return strings.Join(out, ",")
+	return deploy.PackagePath
 }

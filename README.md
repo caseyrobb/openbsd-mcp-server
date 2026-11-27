@@ -73,15 +73,26 @@ GOOS=openbsd GOARCH=amd64 CGO_ENABLED=0 go build -o obsd-mcp ./cmd/obsd-mcp
 
 Every [GitHub release](https://github.com/caseyrobb/openbsd-mcp-server/releases)
 has a `pkg_add` package for amd64 and arm64, named
-`obsd-mcp-<version>-<arch>.tgz`, plus a `SHA256` file. The packages are not
-signed, so check the checksum first:
+`obsd-mcp-<version>-<arch>.tgz`, plus a `SHA256` file and, from v0.3.0, a
+`SHA256.sig` signed with [signify(1)](https://man.openbsd.org/signify).
+Fetch the public key [`signify/obsd-mcp.pub`](signify/obsd-mcp.pub) once,
+keep it in `/etc/signify`, and verify every download against it:
 
 ```sh
-ftp https://github.com/caseyrobb/openbsd-mcp-server/releases/download/v0.1.0/obsd-mcp-0.1.0-amd64.tgz
-ftp https://github.com/caseyrobb/openbsd-mcp-server/releases/download/v0.1.0/SHA256
-sha256 -C SHA256 obsd-mcp-0.1.0-amd64.tgz
-doas pkg_add -D unsigned ./obsd-mcp-0.1.0-amd64.tgz
+doas ftp -o /etc/signify/obsd-mcp.pub \
+    https://raw.githubusercontent.com/caseyrobb/openbsd-mcp-server/main/signify/obsd-mcp.pub
+v=0.3.0 a=$(arch -s)
+ftp https://github.com/caseyrobb/openbsd-mcp-server/releases/download/v$v/obsd-mcp-$v-$a.tgz
+ftp https://github.com/caseyrobb/openbsd-mcp-server/releases/download/v$v/SHA256.sig
+signify -C -p /etc/signify/obsd-mcp.pub -x SHA256.sig obsd-mcp-$v-$a.tgz
+doas pkg_add -D unsigned ./obsd-mcp-$v-$a.tgz
 ```
+
+`signify -C` checks the signature and then the file's checksum, so a
+tampered package or `SHA256.sig` fails. `pkg_add -D unsigned` is still needed
+because the package itself carries no pkg_add signature. Releases before
+v0.3.0 and the `dev` builds only have an unsigned `SHA256`
+(`sha256 -C SHA256 <file>`).
 
 This installs `/usr/local/libexec/obsd-mcp`. The `dev` prerelease always
 holds a build of the latest `main`.
@@ -104,10 +115,39 @@ Any root-owned location that the `obsdmcp` user cannot write to will do. The
 server never reads or runs anything under `/usr/local`; this is only where its
 own binary lives.
 
-Restrict the user's SSH key to the server in `~obsdmcp/.ssh/authorized_keys`:
+Pin the account to the server in sshd. `-print-sshd` prints a `Match User`
+block built from the same `-enable` list, so the forced command always
+matches the features you chose:
+
+```sh
+/usr/local/libexec/obsd-mcp -enable pf -print-sshd obsdmcp | doas tee -a /etc/ssh/sshd_config
+doas sshd -t && doas rcctl reload sshd
+```
 
 ```
-restrict,command="/usr/local/libexec/obsd-mcp" ssh-ed25519 AAAA... agent-key
+Match User obsdmcp
+	ForceCommand /usr/local/libexec/obsd-mcp -enable pf
+	AuthenticationMethods publickey
+	DisableForwarding yes
+	PermitTTY no
+	PermitTunnel no
+	PermitUserRC no
+Match all
+```
+
+`ForceCommand` overrides whatever command the client asks for, so this
+account can only ever start the server. The block also turns off password
+login, every kind of forwarding (TCP, agent, X11 and Unix sockets), TTYs,
+tunnels and `~/.ssh/rc`. The final `Match all` ends the block, so settings
+added to the file later stay global. The flag warns if the server binary is
+not root-owned or is writable by others: whoever can replace it controls
+what the account runs.
+
+Also restrict the key itself in `~obsdmcp/.ssh/authorized_keys`, so the
+key stays limited even if the sshd block is removed:
+
+```
+restrict,command="/usr/local/libexec/obsd-mcp -enable pf" ssh-ed25519 AAAA... agent-key
 ```
 
 The user needs a real login shell, because sshd runs forced commands through
@@ -116,7 +156,8 @@ The user needs a real login shell, because sshd runs forced commands through
 ### Optional features
 
 These are off by default. Turn them on with `-enable` in the
-forced command, for example:
+forced command; rerun `-print-sshd` with the new list and replace the old
+block, and update the `command=` in `authorized_keys` to match, for example:
 
 ```
 restrict,command="/usr/local/libexec/obsd-mcp -enable pf,unbound,bgp" ssh-ed25519 AAAA... agent-key
@@ -193,6 +234,7 @@ Or in a generic `mcpServers` JSON config:
 |---|---|
 | `-enable pf,unbound,bgp,ntp,services,confcheck` | Enable opt-in tools (see above) |
 | `-print-doas USER` | Print the `doas.conf` rules USER needs for `-enable`, then exit |
+| `-print-sshd USER` | Print an `sshd_config` `Match User` block that pins USER to this server with `-enable`, then exit |
 | `-print-policy` | Print the exact `unveil`/`pledge` calls and exit |
 | `-unsafe-dev` | Run without a sandbox on non-OpenBSD systems, for development only |
 | `-version` | Print the version and exit |
@@ -243,9 +285,13 @@ requests and on version tags. It runs the Linux tests, cross-compiles the
 server and its test binaries for amd64 and arm64, then boots an OpenBSD VM
 for each architecture. In the VM it runs every test, including the real
 `pledge`/`unveil` sandbox tests. It then installs the `-print-doas` rules
-for `pf`, `services`, `confcheck` (and `ntp` if ntpd runs) and runs every
-view of those features inside the sandbox through doas. Finally it builds
-the package with `pkg_create`.
+for `pf`, `confcheck`, `ntp` (if ntpd runs) and, on amd64, `services`,
+and runs every view of those features inside the sandbox through doas. It
+appends the `-print-sshd` block to a copy of `sshd_config`, checks it with
+`sshd -t` and confirms with `sshd -T` that only the server user is pinned.
+Finally it builds the package with `pkg_create`. The Linux job also runs
+`govulncheck` for Linux and both OpenBSD targets, and Dependabot opens
+weekly PRs for the Go module and the pinned actions.
 
 Versions follow [semantic versioning](https://semver.org) and come from git
 tags (`scripts/version.sh`):
@@ -269,10 +315,37 @@ outside `main`, fail the workflow. OpenBSD sorts `pre` and `rc` versions
 before the plain version, so `pkg_add -u` upgrades from a dev or rc build to
 the final release.
 
+### Release signing
+
+Tag builds sign `SHA256` with signify. The secret key lives only in the
+`release` GitHub environment, which is limited to `v*` tags, so pull
+requests and `main` builds cannot read it. The release job checks the new
+signature against the committed `signify/obsd-mcp.pub` and fails if the two
+keys do not match, or if either is missing.
+
+One-time setup, on an OpenBSD host in a private directory. signify cannot
+read a passphrase in CI, so the key is created without one (`-n`):
+
+```sh
+signify -G -n -c "obsd-mcp release key" -p obsd-mcp.pub -s obsd-mcp.sec
+
+r=repos/caseyrobb/openbsd-mcp-server
+echo '{"deployment_branch_policy":{"protected_branches":false,"custom_branch_policies":true}}' |
+    gh api -X PUT $r/environments/release --input -
+gh api -X POST $r/environments/release/deployment-branch-policies -f name='v*' -f type=tag
+gh secret set SIGNIFY_SECRET_KEY --env release < obsd-mcp.sec
+```
+
+Commit `obsd-mcp.pub` as `signify/obsd-mcp.pub`, then move `obsd-mcp.sec`
+to offline storage. Rotating the key means a new key pair, a new secret and
+a new committed public key; say so in the release notes.
+
 ### Layout
 
 ```
-.github/workflows/   CI: test, OpenBSD VM tests, pkg_create packages, releases
+.github/workflows/   CI: test, govulncheck, OpenBSD VM tests, pkg_create packages, signed releases
+.github/dependabot.yml  weekly Go module and action update PRs
+signify/             release signing public key
 scripts/             version.sh (tags -> semver), build.sh, vmtest.sh, mkpkg.sh
 pkg/DESCR            package description
 cmd/obsd-mcp/        entry point: refuse root, build policy, sandbox, serve stdio
@@ -283,6 +356,7 @@ internal/collect/    system and network collectors (no MCP dependency)
 internal/confread/   allowlisted config reader with path and file checks
 internal/redact/     secret redaction
 internal/audit/      syslog audit lines via sendsyslog(2), input sanitizing
+internal/deploy/     -print-sshd: sshd_config Match block (text only, writes nothing)
 internal/mcpserver/  MCP tool definitions (the only package using the SDK)
 docs/                architecture and security notes
 ```

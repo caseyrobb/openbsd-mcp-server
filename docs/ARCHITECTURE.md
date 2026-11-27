@@ -33,6 +33,8 @@ internal/collect/      collectors (system, network); plain structs, no MCP
 internal/confread/     config allowlist, path validation, safe open
 internal/redact/       secret redaction shared by confread and network_summary
 internal/mcpserver/    the only MCP-aware package; tools -> collectors
+internal/audit/        syslog audit lines (sendsyslog), input sanitizing
+internal/deploy/       -print-sshd text generator; never writes a file
 docs/                  this file, deployment notes
 ```
 
@@ -321,9 +323,32 @@ installs and `/etc/newsyslog.conf`.
 
 ```
 useradd -m -s /bin/ksh -c "read-only MCP" obsdmcp     # NOT in wheel
+obsd-mcp -enable pf -print-doas obsdmcp | doas tee -a /etc/doas.conf
+obsd-mcp -enable pf -print-sshd obsdmcp | doas tee -a /etc/ssh/sshd_config
 # ~obsdmcp/.ssh/authorized_keys:
-restrict,command="/usr/local/libexec/obsd-mcp" ssh-ed25519 AAAA... agent
+restrict,command="/usr/local/libexec/obsd-mcp -enable pf" ssh-ed25519 AAAA... agent
 ```
+
+Both generators print text for the operator to review; the server never
+writes host configuration. The `-print-sshd` block is the primary
+restriction: `ForceCommand` wins over the client's command and over
+`command=` in `authorized_keys`. `authorized_keys` `restrict` is the
+second layer, for when the block is edited away. The block:
+
+| Setting | Why |
+|---|---|
+| `ForceCommand <server> [-enable ...]` | the account can only start the server, with exactly these features |
+| `AuthenticationMethods publickey` | no password login for a service account |
+| `DisableForwarding yes` | no TCP, agent, X11 or Unix-socket forwarding: the account cannot be used as a pivot |
+| `PermitTTY no` | MCP is a byte stream; a TTY would only mangle it |
+| `PermitTunnel no`, `PermitUserRC no` | no tun(4) devices, no `~/.ssh/rc` run before the command |
+| `Match all` | closes the block so later global lines are not scoped to this user |
+
+The server path is put in the forced command without quoting, so
+`deploy.Command` only accepts clean absolute paths of `[A-Za-z0-9._+/-]`.
+Feature names come from the fixed feature list and user names match the
+same conservative pattern as `-print-doas`. CI appends the block to a copy
+of the VM's `sshd_config` and checks it with `sshd -t` and `sshd -T -C`.
 
 The server binary can live anywhere root-owned. It is our artifact and not a
 dependency, and it never reads or executes anything under `/usr/local`. The
