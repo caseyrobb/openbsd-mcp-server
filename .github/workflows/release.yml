@@ -145,13 +145,14 @@ jobs:
           ./dist/${{ matrix.goarch }}/obsd-mcp -enable pf,confcheck -print-sshd "$me" >> "$cfg"
           sudo sshd -t -f "$cfg"
           eff() { sudo sshd -T -f "$cfg" -C "user=$1,host=localhost,addr=127.0.0.1"; }
-          eff "$me" | tee /dev/stderr | grep -q "^forcecommand .*/obsd-mcp -enable pf,confcheck$"
+          # sshd -T prints keywords in mixed case (ForceCommand), so match -i.
+          eff "$me" | grep -qi "^forcecommand .*/obsd-mcp -enable pf,confcheck$"
           for want in "permittty no" "disableforwarding yes" "authenticationmethods publickey" \
               "permittunnel no" "permituserrc no"; do
-            eff "$me" | grep -qx "$want" || { echo "missing: $want"; exit 1; }
+            eff "$me" | grep -qix "$want" || { echo "missing: $want"; exit 1; }
           done
           # "Match all" ends the block: other users keep the global settings.
-          eff nobody | grep -qx "forcecommand none"
+          eff nobody | grep -qix "forcecommand none"
 
       - name: Build package with pkg_create
         shell: cpa.sh {0} --sync-files vm-to-runner --environment-variables PKG_VERSION
