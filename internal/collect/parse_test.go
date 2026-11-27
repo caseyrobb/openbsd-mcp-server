@@ -402,3 +402,28 @@ func FuzzParsers(f *testing.F) {
 		}
 	})
 }
+
+func TestParseSSHDConfig(t *testing.T) {
+	in := "port 22\naddressfamily any\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:22\nPermitRootLogin no\n" +
+		"passwordauthentication no\nsubsystem sftp /usr/libexec/sftp-server\nhostkey /etc/ssh/ssh_host_ed25519_key\n" +
+		"hostkey /etc/ssh/ssh_host_rsa_key\nsshd: no hostkeys available -- exiting.\n"
+	got, ok := ParseSSHDConfig(in)
+	if !ok || got["port"][0] != "22" || len(got["listenaddress"]) != 2 || got["permitrootlogin"][0] != "no" ||
+		got["subsystem"][0] != "sftp /usr/libexec/sftp-server" || len(got["hostkey"]) != 2 {
+		t.Errorf("got %v", got)
+	}
+	if _, has := got["sshd:"]; has {
+		t.Error("error line parsed as a keyword")
+	}
+}
+
+func TestParsePatches(t *testing.T) {
+	got, ok := ParsePatches("79-001_xserver\n80-001_sshd\n80-003_libcrypto\n80-002_ld.so\nrollback.tgz\n")
+	if !ok || len(got.Installed) != 3 || got.Latest["80"].Number != 3 || got.Latest["80"].Name != "libcrypto" ||
+		got.Latest["79"].Name != "xserver" {
+		t.Errorf("got %+v", got)
+	}
+	if _, ok := ParsePatches(""); ok {
+		t.Error("no patches parsed as some")
+	}
+}

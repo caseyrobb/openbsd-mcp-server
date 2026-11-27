@@ -75,7 +75,7 @@ func TestValidateSpecRejects(t *testing.T) {
 
 func TestSysctlArgsAreReadOnly(t *testing.T) {
 	// sysctl writes when given name=value; the fixed arg list must never do that.
-	for _, n := range SysctlNames {
+	for _, n := range append(append([]string(nil), SysctlNames...), SecuritySysctlNames...) {
 		if strings.ContainsAny(n, "= ") || strings.HasPrefix(n, "-") {
 			t.Errorf("sysctl arg %q could mutate or alter behaviour", n)
 		}
@@ -113,7 +113,7 @@ func TestBinariesPerFeature(t *testing.T) {
 			"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/bin/ksh", "/bin/sh"}},
 		{all, []string{DoasPath, "/usr/sbin/bgpctl", "/bin/ps", "/usr/bin/netstat"},
 			append([]string{"/usr/sbin/ntpctl", "/usr/sbin/rcctl", "/usr/sbin/bgpd", "/usr/sbin/sshd", "/bin/ksh", "/bin/sh",
-				"/usr/bin/tail"}, ctlPrograms...)},
+				"/usr/bin/tail", "/bin/ls", "/usr/bin/last"}, ctlPrograms...)},
 		{Enabled{FeaturePF: true}, []string{DoasPath}, []string{"/sbin/pfctl", "/usr/sbin/bgpctl"}},
 		{Enabled{FeatureUnbound: true}, []string{DoasPath}, []string{"/usr/sbin/unbound-control", "/usr/sbin/bgpctl"}},
 		{Enabled{FeatureBGP: true}, []string{"/usr/sbin/bgpctl"}, []string{DoasPath}},
@@ -459,5 +459,38 @@ func TestMaxOutputOnlyForLogs(t *testing.T) {
 	}
 	if validateSpec(Spec{Path: "/bin/df", MaxOutput: 64 << 20}) == nil {
 		t.Error("huge MaxOutput accepted")
+	}
+}
+
+// TestSecurityShapes pins the security posture commands.
+func TestSecurityShapes(t *testing.T) {
+	want := map[ID]string{
+		SecPatches: "doas /bin/ls -1 /var/syspatch",
+		SecSSHD:    "doas /usr/sbin/sshd -T",
+		SecSysctl:  "/sbin/sysctl " + strings.Join(SecuritySysctlNames, " "),
+		SecLogins:  "doas /usr/bin/last -n 50",
+	}
+	n := 0
+	for id, s := range registry {
+		if s.Feature != FeatureSecurity {
+			continue
+		}
+		n++
+		got := s.Path + " " + strings.Join(s.Args, " ")
+		if s.Doas {
+			got = "doas " + got
+		}
+		if want[id] != got {
+			t.Errorf("%s: %q, want %q", id, got, want[id])
+		}
+	}
+	if n != len(want) {
+		t.Errorf("%d security commands, want %d", n, len(want))
+	}
+	// syspatch is never run: even -l creates a directory under /tmp.
+	for id, s := range registry {
+		if strings.HasSuffix(s.Path, "/syspatch") {
+			t.Errorf("%s runs syspatch", id)
+		}
 	}
 }

@@ -54,12 +54,18 @@ const (
 	// FeatureIPsec shows flows and SAs (ipsecctl -s, ikectl show sa).
 	// Never ipsecctl -k, which prints keying material.
 	FeatureIPsec Feature = "ipsec"
+	// FeatureSecurity shows security posture: installed patches (a listing
+	// of /var/syspatch, because syspatch itself always mkdirs under /tmp),
+	// sshd's effective settings (sshd -T), login history (last) and
+	// security-relevant sysctls.
+	FeatureSecurity Feature = "security"
 )
 
 // Features lists every opt-in feature in display order.
 var Features = []Feature{
 	FeaturePF, FeatureUnbound, FeatureBGP, FeatureNTP, FeatureServices, FeatureConfCheck, FeatureLogs,
 	FeatureOSPF, FeatureOSPF6, FeatureRelayd, FeatureSMTPD, FeatureVMD, FeatureUnwind, FeatureIPsec,
+	FeatureSecurity,
 }
 
 // DoasPath is the only privilege wrapper the server may run.
@@ -150,6 +156,8 @@ const (
 	LogCron        ID = "log_cron"
 	LogHTTPDAccess ID = "log_httpd_access"
 	LogHTTPDError  ID = "log_httpd_error"
+	LogDaily       ID = "log_daily"
+	LogSecurityOut ID = "log_security_out"
 
 	OSPFSummary    ID = "ospf_summary"
 	OSPFNeighbors  ID = "ospf_neighbors"
@@ -180,6 +188,11 @@ const (
 	IPsecFlows ID = "ipsec_flows"
 	IPsecSAs   ID = "ipsec_sas"
 	IKEDSAs    ID = "iked_sas"
+
+	SecPatches ID = "sec_patches"
+	SecSSHD    ID = "sec_sshd"
+	SecSysctl  ID = "sec_sysctl"
+	SecLogins  ID = "sec_logins"
 )
 
 // Spec is an immutable command invocation.
@@ -236,6 +249,26 @@ var SysctlNames = []string{
 	"hw.usermem",
 	"vm.loadavg",
 }
+
+// SecuritySysctlNames are security-relevant MIBs present on every
+// architecture GENERIC supports (hw.smt and machdep.allowaperture are not).
+var SecuritySysctlNames = []string{
+	"kern.securelevel",
+	"kern.allowkmem",
+	"kern.allowdt",
+	"kern.wxabort",
+	"kern.nosuidcoredump",
+	"kern.global_ptrace",
+	"net.inet.ip.forwarding",
+	"net.inet6.ip6.forwarding",
+}
+
+// SyspatchDir holds one directory per installed patch, which is all
+// syspatch -l reads.
+const SyspatchDir = "/var/syspatch"
+
+// LastLogins is how many wtmp entries the logins view shows.
+const LastLogins = "50"
 
 func pfctl(modifier string) Spec {
 	return Spec{Path: "/sbin/pfctl", Args: []string{"-s", modifier}, Feature: FeaturePF, Doas: true}
@@ -376,6 +409,8 @@ var registry = map[ID]Spec{
 	LogCron:        logTail("/var/cron/log"),
 	LogHTTPDAccess: logTail("/var/www/logs/access.log"),
 	LogHTTPDError:  logTail("/var/www/logs/error.log"),
+	LogDaily:       logTail("/var/log/daily.out"),
+	LogSecurityOut: logTail("/var/log/security.out"),
 
 	// "show" only; never reload, fib couple/decouple/reload or log.
 	OSPFSummary:    ctl(FeatureOSPF, "/usr/sbin/ospfctl", "show", "summary"),
@@ -413,6 +448,13 @@ var registry = map[ID]Spec{
 	IPsecFlows: ctl(FeatureIPsec, "/sbin/ipsecctl", "-s", "flow"),
 	IPsecSAs:   ctl(FeatureIPsec, "/sbin/ipsecctl", "-s", "sa"),
 	IKEDSAs:    ctl(FeatureIPsec, "/usr/sbin/ikectl", "show", "sa"),
+
+	// Security posture. ls/last/sshd run through doas so they cannot be
+	// pointed at other paths; sysctl is unprivileged and already unveiled.
+	SecPatches: {Path: "/bin/ls", Args: []string{"-1", SyspatchDir}, Feature: FeatureSecurity, Doas: true},
+	SecSSHD:    {Path: "/usr/sbin/sshd", Args: []string{"-T"}, Feature: FeatureSecurity, Doas: true},
+	SecSysctl:  {Path: "/sbin/sysctl", Args: SecuritySysctlNames, Feature: FeatureSecurity},
+	SecLogins:  {Path: "/usr/bin/last", Args: []string{"-n", LastLogins}, Feature: FeatureSecurity, Doas: true},
 }
 
 // BaseDirs are the only directories registered binaries may live in.
@@ -430,7 +472,11 @@ var logArgs = map[string]bool{
 	"/var/log/messages": true, "/var/log/daemon": true, "/var/log/authlog": true,
 	"/var/log/secure": true, "/var/log/maillog": true, "/var/log/xferlog": true,
 	"/var/cron/log": true, "/var/www/logs/access.log": true, "/var/www/logs/error.log": true,
+	"/var/log/daily.out": true, "/var/log/security.out": true,
 }
+
+// dirArgs are the only directories that may be named as an argument.
+var dirArgs = map[string]bool{SyspatchDir: true}
 
 // Enabled is the set of opt-in features the operator turned on.
 // The zero value enables none.
@@ -591,8 +637,8 @@ func validateSpec(s Spec) error {
 		// Absolute-path arguments may only name a base program, a control
 		// socket under /var/run or an allowlisted config file.
 		if strings.HasPrefix(a, "/") &&
-			(path.Clean(a) != a || !(inDirs(a, BaseDirs) || inDirs(a, socketDirs) || configArgs[a] || logArgs[a])) {
-			return fmt.Errorf("arg %q is a path outside base program, socket, config or log allowlists", a)
+			(path.Clean(a) != a || !(inDirs(a, BaseDirs) || inDirs(a, socketDirs) || configArgs[a] || logArgs[a] || dirArgs[a])) {
+			return fmt.Errorf("arg %q is a path outside base program, socket, config, log or directory allowlists", a)
 		}
 	}
 	return nil

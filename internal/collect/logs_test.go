@@ -149,7 +149,7 @@ func TestLogsCoverEveryLogCommand(t *testing.T) {
 		seen[l.ID] = true
 	}
 	for _, id := range []basecmd.ID{basecmd.LogMessages, basecmd.LogDaemon, basecmd.LogAuth, basecmd.LogSecure,
-		basecmd.LogMail, basecmd.LogXfer, basecmd.LogCron, basecmd.LogHTTPDAccess, basecmd.LogHTTPDError} {
+		basecmd.LogMail, basecmd.LogXfer, basecmd.LogCron, basecmd.LogHTTPDAccess, basecmd.LogHTTPDError, basecmd.LogDaily, basecmd.LogSecurityOut} {
 		if !seen[id] {
 			t.Errorf("%s has no log_tail entry", id)
 		}

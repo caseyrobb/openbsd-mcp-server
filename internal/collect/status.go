@@ -203,9 +203,21 @@ var (
 	}
 )
 
+// Security is the security posture tool.
+var Security = Subsystem{
+	Name: "security", Feature: basecmd.FeatureSecurity,
+	Views: []View{
+		{"patches", basecmd.SecPatches, "installed syspatch(8) errata patches (a listing of /var/syspatch; does not contact the mirror)"},
+		{"sshd", basecmd.SecSSHD, "sshd -T: sshd's effective settings (key paths only, never key contents)"},
+		{"sysctl", basecmd.SecSysctl, "securelevel, allowkmem, allowdt, wxabort, nosuidcoredump, global_ptrace, IP forwarding"},
+		{"logins", basecmd.SecLogins, "last -n 50: recent logins, reboots and shutdowns from wtmp"},
+	},
+	Hint: "ls, sshd and last run via 'doas -n'; check /etc/doas.conf against: obsd-mcp -enable security -print-doas <user>",
+}
+
 // Subsystems lists every *_status tool, always-available ones first.
 var Subsystems = []Subsystem{SystemViews, NetworkViews, PF, Unbound, BGP, NTP, Services,
-	OSPF, OSPF6, Relayd, SMTPD, VMD, Unwind, IPsec}
+	OSPF, OSPF6, Relayd, SMTPD, VMD, Unwind, IPsec, Security}
 
 // ViewNames returns the view names in order (the schema enum).
 func (s Subsystem) ViewNames() []string {

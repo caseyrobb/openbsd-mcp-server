@@ -41,6 +41,8 @@ var Logs = []LogSource{
 	{"cron", basecmd.LogCron, "/var/cron/log: cron job runs", LogAuth},
 	{"httpd_access", basecmd.LogHTTPDAccess, "/var/www/logs/access.log: httpd requests (query strings redacted)", LogWeb},
 	{"httpd_error", basecmd.LogHTTPDError, "/var/www/logs/error.log: httpd errors", LogWeb},
+	{"daily", basecmd.LogDaily, "/var/log/daily.out: the last daily(8) run (disk use, network, backups)", LogAuth},
+	{"security_report", basecmd.LogSecurityOut, "/var/log/security.out: the last security(8) report (setuid changes, accounts, file modes)", LogAuth},
 }
 
 // Log tail limits.

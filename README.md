@@ -38,13 +38,14 @@ forced command, so the server itself never opens a socket.
 | `bgp_status` | **Opt-in** (`-enable bgp`). One `bgpctl show` view: `summary`, `neighbors`, `nexthops`, `interfaces`, `rib_memory` |
 | `ntp_status` | **Opt-in** (`-enable ntp`). One `ntpctl -s` view: `status`, `peers`, `sensors`, `all` |
 | `services_status` | **Opt-in** (`-enable services`). One `rcctl ls` view: `enabled`, `started`, `failed` |
-| `log_tail` | **Opt-in** (`-enable logs`). The newest lines of one fixed log: `messages`, `daemon`, `authlog`, `secure`, `maillog`, `xferlog`, `cron`, `httpd_access`, `httpd_error`. Optional `lines` (1-500, default 100) and `match` (plain text, case-insensitive) |
+| `log_tail` | **Opt-in** (`-enable logs`). The newest lines of one fixed log: `messages`, `daemon`, `authlog`, `secure`, `maillog`, `xferlog`, `cron`, `httpd_access`, `httpd_error`, `daily` (`/var/log/daily.out`), `security_report` (`/var/log/security.out`). Optional `lines` (1-500, default 100) and `match` (plain text, case-insensitive) |
 | `ospf_status`, `ospf6_status` | **Opt-in** (`-enable ospf`, `ospf6`). One `ospfctl`/`ospf6ctl show` view: `summary`, `neighbors`, `interfaces`, `rib`, `fib` |
 | `relayd_status` | **Opt-in** (`-enable relayd`). One `relayctl show` view: `summary`, `hosts`, `redirects`, `relays`, `routers` |
 | `smtpd_status` | **Opt-in** (`-enable smtpd`). `smtpctl show status` or `show stats`; never the queue, envelopes or messages |
 | `vmd_status` | **Opt-in** (`-enable vmd`). `vmctl status` |
 | `unwind_status` | **Opt-in** (`-enable unwind`). `unwindctl status` or `status autoconf` |
 | `ipsec_status` | **Opt-in** (`-enable ipsec`). `flows` (`ipsecctl -s flow`), `sas` (`ipsecctl -s sa`, never `-k`), `iked_sas` (`ikectl show sa`) |
+| `security_status` | **Opt-in** (`-enable security`). `patches` (installed syspatch errata), `sshd` (`sshd -T` effective settings), `sysctl` (securelevel, allowkmem, allowdt, wxabort, nosuidcoredump, global_ptrace, IP forwarding), `logins` (`last -n 50`) |
 | `config_check` | **Opt-in** (`-enable confcheck`). Runs one daemon's configtest mode (`-n`, `sshd -t`) and reports `valid` plus the checker's messages: `pf`, `bgpd`, `httpd`, `relayd`, `smtpd`, `iked`, `ntpd`, `ospfd`, `ospf6d`, `dhcpd`, `unwind`, `vmd`, `snmpd`, `sshd`, `unbound` |
 
 The `config_read` allowlist is `/etc/rc.conf.local`, `pf.conf`, `sysctl.conf`,
@@ -71,7 +72,9 @@ agent can compare numbers without re-reading text tables:
 | `system_status swap` | per device: `total_bytes`, `used_bytes`, `available_bytes`, `capacity_percent`, `priority` |
 | `bgp_status summary` | per neighbor: `as`, `established`, `state`, `prefixes_received`, `max_prefix`, `msgs_received`, `msgs_sent`, `out_queue`, `up_down` |
 | `ospf_status neighbors`, `ospf6_status neighbors` | per neighbor: `id`, `priority`, `state`, `interface_state`, `full`, `dead_time`, `address` (ospf only), `interface`, `uptime` |
-| `unbound_status stats`, `smtpd_status stats` | every numeric `key=value` counter, as a map |
+| `unbound_status stats`, `smtpd_status stats`, `security_status sysctl` | every numeric `key=value` value, as a map |
+| `security_status sshd` | every `sshd -T` keyword (lower case) with its values, as a map of lists |
+| `security_status patches` | `installed` patches (`release`, `number`, `name`) and the `latest_per_release` |
 
 `data` is parsed from the redacted output and is omitted when the output
 cannot be parsed; the text `output` is always returned.
@@ -91,6 +94,7 @@ steps list only tools that are registered.
 | `firewall_review` | `pf` | explains the loaded ruleset and state, checks pf.conf parses, compares listeners with the rules |
 | `service_health` | `services`, `confcheck` or `logs` | failed services, their config check and log lines. Optional `service` |
 | `routing_health` | `bgp`, `ospf` or `ospf6` | sessions and neighbors from the parsed data, RIB versus kernel routes |
+| `security_posture` | `security` | patches, kernel security sysctls, sshd settings, exposed listeners, pf state, recent logins, security(8) report |
 | `auth_review` | `logs` | logins, failures and doas use from `authlog` and `secure` |
 
 Every prompt tells the agent that the server is read-only, to quote evidence,
@@ -242,12 +246,13 @@ restrict,command="/usr/local/libexec/obsd-mcp -enable pf,unbound,bgp" ssh-ed2551
 | `ntp` | `/usr/sbin/ntpctl -s <view>` | `doas -n` (ntpd's socket is 0660 root) | doas rules; ntpd running |
 | `services` | `/usr/sbin/rcctl ls on\|started\|failed` | `doas -n` (rcctl is a shell script, and `started`/`failed` need root) | doas rules |
 | `confcheck` | each daemon's `-n` configtest, `sshd -t`, `pfctl -n -f /etc/pf.conf`, `unbound-checkconf` | `doas -n` (most configs are 0600 root) | doas rules |
-| `logs` | `/usr/bin/tail -n 1000 <one of 9 fixed logs>` | `doas -n` (most logs are 0640 or 0600 root) | doas rules |
+| `logs` | `/usr/bin/tail -n 1000 <one of 11 fixed logs>` | `doas -n` (most logs are 0640 or 0600 root) | doas rules |
 | `ospf`, `ospf6` | `/usr/sbin/ospfctl`/`ospf6ctl show <view>` | `doas -n` (the control socket also accepts reload and fib changes) | doas rules; daemon running |
 | `relayd` | `/usr/sbin/relayctl show <view>` | `doas -n` (the socket also accepts enable/disable/reload) | doas rules; relayd running |
 | `smtpd` | `/usr/sbin/smtpctl show status\|stats` | `doas -n` (the socket also accepts pause/remove/schedule) | doas rules; smtpd running |
 | `vmd` | `/usr/sbin/vmctl status` | `doas -n` (the socket also accepts start/stop) | doas rules; vmd running |
 | `unwind` | `/usr/sbin/unwindctl status [autoconf]` | `doas -n` (the socket also accepts reload) | doas rules; unwind running |
+| `security` | `/bin/ls -1 /var/syspatch`, `/usr/sbin/sshd -T`, `/usr/bin/last -n 50`, `/sbin/sysctl <8 fixed MIBs>` | `doas -n` for `ls`, `sshd` and `last` (pinned paths and counts); `sysctl` runs unprivileged | doas rules |
 | `ipsec` | `/sbin/ipsecctl -s flow\|sa`, `/usr/sbin/ikectl show sa` | `doas -n` (PF_KEY and iked's socket need root; `-k` is never run) | doas rules; iked running for `iked_sas` |
 
 Generate the exact `doas.conf` rules from the server itself, so they always
@@ -372,7 +377,15 @@ with minimal configs and adds each feature whose daemon came up. It then
 runs every view of those features inside the sandbox through doas. It
 appends the `-print-sshd` block to a copy of `sshd_config`, checks it with
 `sshd -t` and confirms with `sshd -T` that only the server user is pinned.
-Finally it builds the package with `pkg_create`. The Linux job also runs
+It builds the package with `pkg_create`, then runs an end-to-end test of
+that package (`scripts/e2e.sh`): it installs it with `pkg_add`, checks the
+binary is root-owned 0555, creates the `obsdmcp` user, installs the
+`-print-doas` rules and the `-print-sshd` block, and gives the user a
+restricted key. The `internal/e2e` test then speaks MCP to the server over
+`ssh obsdmcp@127.0.0.1`: it lists tools and prompts, calls tools including
+parsed `data`, and finds its own session and calls in the audit log through
+`log_tail`. It also checks that sshd ignores a client-supplied command,
+refuses port forwarding and refuses a TTY. The Linux job also runs
 `govulncheck` for Linux and both OpenBSD targets, and Dependabot opens
 weekly PRs for the Go module and the pinned actions.
 
@@ -429,7 +442,7 @@ a new committed public key; say so in the release notes.
 .github/workflows/   CI: test, govulncheck, OpenBSD VM tests, pkg_create packages, signed releases
 .github/dependabot.yml  weekly Go module and action update PRs
 signify/             release signing public key
-scripts/             version.sh (tags -> semver), build.sh, vmtest.sh, mkpkg.sh
+scripts/             version.sh (tags -> semver), build.sh, vmtest.sh, mkpkg.sh, e2e.sh
 pkg/DESCR            package description
 cmd/obsd-mcp/        entry point: refuse root, build policy, sandbox, serve stdio
 internal/basecmd/    allowlist of runnable base binaries and their fixed argv
@@ -439,6 +452,7 @@ internal/collect/    system and network collectors (no MCP dependency)
 internal/confread/   allowlisted config reader with path and file checks
 internal/redact/     secret redaction
 internal/audit/      syslog audit lines via sendsyslog(2), input sanitizing
+internal/e2e/        end-to-end test over ssh against the installed package (CI VM only)
 internal/deploy/     -print-sshd: sshd_config Match block (text only, writes nothing)
 internal/mcpserver/  MCP tool definitions (the only package using the SDK)
 docs/                architecture and security notes

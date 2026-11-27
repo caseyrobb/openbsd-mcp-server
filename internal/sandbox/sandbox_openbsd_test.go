@@ -278,7 +278,8 @@ func probeFeatures(en basecmd.Enabled) int {
 	for _, bin := range []string{"/sbin/pfctl", "/usr/sbin/unbound-control", "/usr/sbin/ntpctl",
 		"/usr/sbin/rcctl", "/bin/ksh", "/usr/sbin/sshd", "/usr/sbin/bgpd", "/usr/bin/tail",
 		"/usr/sbin/ospfctl", "/usr/sbin/ospf6ctl", "/usr/sbin/relayctl", "/usr/sbin/smtpctl",
-		"/usr/sbin/vmctl", "/usr/sbin/unwindctl", "/sbin/ipsecctl", "/usr/sbin/ikectl"} {
+		"/usr/sbin/vmctl", "/usr/sbin/unwindctl", "/sbin/ipsecctl", "/usr/sbin/ikectl",
+		"/bin/ls", "/usr/bin/last"} {
 		step("direct exec %s", bin)
 		var out bytes.Buffer
 		cmd := exec.Command(bin)

@@ -105,6 +105,7 @@ output is redacted.
 | `smtpd` | `doas -n /usr/sbin/smtpctl show <status\|stats>` | The socket also takes pause/resume/remove/schedule. `show queue`, `envelope` and `message` expose addresses and mail and are never run. |
 | `vmd` | `doas -n /usr/sbin/vmctl status` | The socket also takes start/stop/pause. |
 | `unwind` | `doas -n /usr/sbin/unwindctl status [autoconf]` | The socket also takes `reload` and `log`. |
+| `security` | `doas -n /bin/ls -1 /var/syspatch`, `doas -n /usr/sbin/sshd -T`, `doas -n /usr/bin/last -n 50`, `/sbin/sysctl <SecuritySysctlNames>` | Installed patches come from listing `/var/syspatch`, which is all `syspatch -l` reads: syspatch itself always runs `mktemp -d` under `/tmp` before parsing options, so even `-l` writes, and it is never run. `ls`, `sshd` and `last` go through doas so their paths and counts are pinned (an unveiled `ls` or `last -f` could be pointed elsewhere). The sysctl list leaves out MIBs that only exist on some architectures (`hw.smt`, `machdep.allowaperture`), because one unknown name fails the whole command. |
 | `ipsec` | `doas -n /sbin/ipsecctl -s <flow\|sa>`, `doas -n /usr/sbin/ikectl show sa` | PF_KEY and iked's socket need root. `ipsecctl -k` prints keying material and is forbidden by test; `ikectl show sa` prints SPIs, addresses and IDs only (`ikev2_info_sa`/`ikev2_info_csa` in iked). |
 
 Registry tests enforce the read-only argument shape:
@@ -242,6 +243,21 @@ statistics of `unbound-control stats_noreset` and `smtpctl show stats`.
 JSON-encodable result: NaN and Inf parse as floats but cannot be encoded,
 so they are dropped. `testdata/openbsd80` holds real output from an
 OpenBSD 8.0 host (addresses replaced) for golden tests.
+
+## End-to-end test
+
+`scripts/e2e.sh` runs in the CI VM after `pkg_create`. It does what the
+README tells an operator to do: `pkg_add` the package, check the binary is
+root-owned 0555, `useradd` the server account, append `-print-doas` and
+`-print-sshd` output (failing if `-print-sshd` warns), reload sshd, and give
+the account a `restrict,command=` key. `internal/e2e` (skipped unless
+`OBSDMCP_E2E_SSH` is set) then drives the installed server through
+`ssh -T obsdmcp@127.0.0.1` with the SDK's `CommandTransport`. It checks the
+tool and prompt lists for the enabled features, real calls with parsed
+`data`, and the audit trail (`session_start` with the ssh client address and
+version, `tool_call` with the client name) read back through `log_tail`. It
+also checks the sshd block from the outside: a client-supplied command does
+not run, a remote forward is refused, and a TTY request is refused.
 
 ## Prompts
 

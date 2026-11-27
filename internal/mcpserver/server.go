@@ -154,6 +154,7 @@ var statusTitles = map[string]string{
 	"vmd":      "OpenBSD vmd virtual machines (vmctl status)",
 	"unwind":   "OpenBSD unwind resolver status (unwindctl status)",
 	"ipsec":    "OpenBSD IPsec flows and SAs (ipsecctl -s, ikectl show sa)",
+	"security": "OpenBSD security posture: patches, sshd settings, logins, sysctls",
 }
 
 // StatusInput is the argument to every *_status tool.

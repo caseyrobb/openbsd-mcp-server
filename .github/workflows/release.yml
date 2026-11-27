@@ -121,7 +121,7 @@ jobs:
         shell: cpa.sh {0} --sync-files none
         run: |
           set -e
-          feats=pf,confcheck,logs
+          feats=pf,confcheck,logs,security
           if pgrep -qx ntpd; then feats=$feats,ntp; fi
           if pgrep -qx smtpd; then feats=$feats,smtpd; fi
           # Start daemons the VM can run with a minimal config. A daemon
@@ -179,6 +179,12 @@ jobs:
       - name: Build package with pkg_create
         shell: cpa.sh {0} --sync-files vm-to-runner --environment-variables PKG_VERSION
         run: sh scripts/mkpkg.sh "$PKG_VERSION" dist/${{ matrix.goarch }}/obsd-mcp dist/pkg
+
+      - name: End-to-end test of the installed package over ssh
+        shell: cpa.sh {0} --sync-files none --environment-variables VERSION
+        run: |
+          sh scripts/e2e.sh dist/pkg/obsd-mcp-*.tgz \
+            dist/${{ matrix.goarch }}/tests/e2e.test pf,logs,security "$VERSION"
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -29,6 +29,9 @@ var parsers = map[basecmd.ID]func(string) any{
 	basecmd.Swap:           func(s string) any { return nilIfEmpty(ParseSwap(s)) },
 	basecmd.UnboundStats:   func(s string) any { return nilIfEmpty(ParseKeyValues(s)) },
 	basecmd.SMTPDStats:     func(s string) any { return nilIfEmpty(ParseKeyValues(s)) },
+	basecmd.SecSysctl:      func(s string) any { return nilIfEmpty(ParseKeyValues(s)) },
+	basecmd.SecSSHD:        func(s string) any { return nilIfEmpty(ParseSSHDConfig(s)) },
+	basecmd.SecPatches:     func(s string) any { return nilIfEmpty(ParsePatches(s)) },
 }
 
 // nilIfEmpty turns a zero-length result into a nil interface, so Data is
@@ -490,4 +493,68 @@ func ParseKeyValues(s string) (map[string]float64, bool) {
 		}
 	}
 	return out, len(out) > 0
+}
+
+// --- sshd -T ---
+
+// ParseSSHDConfig maps each lower-case keyword to its values, in order.
+// Keywords that may repeat (hostkey, listenaddress, subsystem, ...) keep
+// every value.
+func ParseSSHDConfig(s string) (map[string][]string, bool) {
+	out := map[string][]string{}
+	for _, l := range strings.Split(s, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(l), " ")
+		if !ok || k == "" || !isKeyword(k) {
+			continue
+		}
+		k = strings.ToLower(k)
+		out[k] = append(out[k], strings.TrimSpace(v))
+	}
+	return out, len(out) > 0
+}
+
+// isKeyword reports whether k looks like an sshd_config keyword: letters
+// only. OpenSSH prints them lower-case or, in newer releases, CamelCase.
+func isKeyword(k string) bool {
+	for _, r := range k {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
+}
+
+// --- installed patches (/var/syspatch) ---
+
+// Patch is one installed errata patch, from a /var/syspatch entry named
+// <release>-<number>_<name>, for example "80-003_sshd".
+type Patch struct {
+	Release string `json:"release"` // OS revision without the dot: "80"
+	Number  int    `json:"number"`
+	Name    string `json:"name"`
+}
+
+// Patches is the patches view: every entry, and the highest number per release.
+type Patches struct {
+	Installed []Patch          `json:"installed"`
+	Latest    map[string]Patch `json:"latest_per_release"`
+}
+
+var patchRe = regexp.MustCompile(`^(\d+)-(\d{3})_([A-Za-z0-9_-]+)$`)
+
+func ParsePatches(s string) (Patches, bool) {
+	out := Patches{Latest: map[string]Patch{}}
+	for _, l := range strings.Split(s, "\n") {
+		m := patchRe.FindStringSubmatch(strings.TrimSpace(l))
+		if m == nil {
+			continue
+		}
+		n, _ := strconv.Atoi(m[2])
+		p := Patch{Release: m[1], Number: n, Name: m[3]}
+		out.Installed = append(out.Installed, p)
+		if cur, ok := out.Latest[p.Release]; !ok || p.Number > cur.Number {
+			out.Latest[p.Release] = p
+		}
+	}
+	return out, len(out.Installed) > 0
 }
