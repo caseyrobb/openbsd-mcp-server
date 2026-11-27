@@ -97,3 +97,48 @@ func TestGoldenNTP(t *testing.T) {
 		t.Errorf("peer 2 %+v", p)
 	}
 }
+
+func TestGoldenBGPSummary(t *testing.T) {
+	got, ok := ParseBGPSummary(golden(t, "bgpctl_summary.txt"))
+	if !ok || len(got) != 7 {
+		t.Fatalf("got %+v", got)
+	}
+	if n := got[1]; n.Neighbor != "2001:db8:abcd::2" || n.AS != "4200000001" || n.UpDown != "2d03h22m" ||
+		n.State != "Active" || n.Established || n.Prefixes != nil {
+		t.Errorf("v6 neighbor %+v", n)
+	}
+	if n := got[5]; n.Neighbor != "upstream2-4" || n.AS != "65123" || n.State != "Connect" {
+		t.Errorf("upstream2-4 %+v", n)
+	}
+}
+
+// ospfd/ospf6d running with no configured interfaces print only a header.
+func TestGoldenOSPFNeighborsEmpty(t *testing.T) {
+	for _, f := range []string{"ospfctl_neighbor_empty.txt", "ospf6ctl_neighbor_empty.txt"} {
+		if got, ok := ParseOSPFNeighbors(golden(t, f)); ok || got != nil {
+			t.Errorf("%s: %+v", f, got)
+		}
+	}
+}
+
+func TestGoldenSwap(t *testing.T) {
+	got, ok := ParseSwap(golden(t, "swapctl_l.txt"))
+	want := SwapDevice{Device: "/dev/sd0b", TotalBytes: 3464800 * 512, AvailBytes: 3464800 * 512}
+	if !ok || len(got) != 1 || got[0] != want {
+		t.Errorf("got %+v", got)
+	}
+}
+
+func TestGoldenKeyValues(t *testing.T) {
+	ub, ok := ParseKeyValues(golden(t, "unbound_stats_head.txt"))
+	if v, has := ub["thread0.requestlist.exceeded"]; !ok || len(ub) != 20 || !has || v != 0 {
+		t.Errorf("unbound %v", ub)
+	}
+	sm, ok := ParseKeyValues(golden(t, "smtpctl_stats.txt"))
+	if !ok || len(sm) != 17 || sm["uptime"] != 225726 || sm["smtp.session.local"] != 3 {
+		t.Errorf("smtpd %v", sm)
+	}
+	if _, has := sm["uptime.human"]; has {
+		t.Error("non-numeric uptime.human parsed")
+	}
+}

@@ -1,6 +1,7 @@
 package collect
 
 import (
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -13,13 +14,21 @@ import (
 // parser never fails the call: the text output is always returned too, and
 // Data is a convenience on top of it. Formats are taken from the base
 // sources (pfctl_parser.c print_status, sysctl.c print_sensor, netstat
-// if.c intpr, ntpd.c show_status_msg/show_peer_msg).
+// if.c intpr, ntpd.c show_status_msg/show_peer_msg, bgpctl output.c
+// show_summary, ospfctl output.c show_neighbor, ospf6ctl.c show_nbr_msg,
+// swapctl swaplist.c list_swap, unbound-control/smtpctl key=value stats).
 var parsers = map[basecmd.ID]func(string) any{
-	basecmd.PfInfo:    func(s string) any { return nilIfEmpty(ParsePfInfo(s)) },
-	basecmd.Sensors:   func(s string) any { return nilIfEmpty(ParseSensors(s)) },
-	basecmd.NetIfaces: func(s string) any { return nilIfEmpty(ParseNetstatIfaces(s)) },
-	basecmd.NTPStatus: func(s string) any { return nilIfEmpty(ParseNTPStatus(s)) },
-	basecmd.NTPPeers:  func(s string) any { return nilIfEmpty(ParseNTPPeers(s)) },
+	basecmd.PfInfo:         func(s string) any { return nilIfEmpty(ParsePfInfo(s)) },
+	basecmd.Sensors:        func(s string) any { return nilIfEmpty(ParseSensors(s)) },
+	basecmd.NetIfaces:      func(s string) any { return nilIfEmpty(ParseNetstatIfaces(s)) },
+	basecmd.NTPStatus:      func(s string) any { return nilIfEmpty(ParseNTPStatus(s)) },
+	basecmd.NTPPeers:       func(s string) any { return nilIfEmpty(ParseNTPPeers(s)) },
+	basecmd.BGPSummary:     func(s string) any { return nilIfEmpty(ParseBGPSummary(s)) },
+	basecmd.OSPFNeighbors:  func(s string) any { return nilIfEmpty(ParseOSPFNeighbors(s)) },
+	basecmd.OSPF6Neighbors: func(s string) any { return nilIfEmpty(ParseOSPFNeighbors(s)) },
+	basecmd.Swap:           func(s string) any { return nilIfEmpty(ParseSwap(s)) },
+	basecmd.UnboundStats:   func(s string) any { return nilIfEmpty(ParseKeyValues(s)) },
+	basecmd.SMTPDStats:     func(s string) any { return nilIfEmpty(ParseKeyValues(s)) },
 }
 
 // nilIfEmpty turns a zero-length result into a nil interface, so Data is
@@ -163,7 +172,7 @@ func ParseSensors(s string) ([]Sensor, bool) {
 		if strings.HasSuffix(num, "%") && unit == "" {
 			num, unit = strings.TrimSuffix(num, "%"), "%"
 		}
-		if f, err := strconv.ParseFloat(num, 64); err == nil {
+		if f, err := strconv.ParseFloat(num, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
 			x.Value, x.Number, x.Unit = num, &f, unit
 		}
 		out = append(out, x)
@@ -322,4 +331,163 @@ func msec(s string) *float64 {
 		return nil
 	}
 	return &v
+}
+
+// --- bgpctl show summary ---
+
+// BGPNeighbor is one row of bgpctl show summary.
+type BGPNeighbor struct {
+	Neighbor string `json:"neighbor"` // description or address, as bgpctl prints it (max 28 chars)
+	AS       string `json:"as"`       // as printed: "65001" or asdot "1.10"
+	MsgRcvd  uint64 `json:"msgs_received"`
+	MsgSent  uint64 `json:"msgs_sent"`
+	OutQ     uint64 `json:"out_queue"`
+	UpDown   string `json:"up_down"` // time since the last state change, or "Never"
+	// State is the session state when not established ("Active", "Idle",
+	// "Template", ...); Established sessions report prefixes instead.
+	State       string  `json:"state"`
+	Established bool    `json:"established"`
+	Prefixes    *uint64 `json:"prefixes_received,omitempty"`
+	MaxPrefix   *uint64 `json:"max_prefix,omitempty"`
+}
+
+// ParseBGPSummary reads rows from the right: the neighbor description can
+// contain spaces, the last six columns cannot.
+func ParseBGPSummary(s string) ([]BGPNeighbor, bool) {
+	var out []BGPNeighbor
+	for _, l := range strings.Split(s, "\n") {
+		f := strings.Fields(l)
+		if len(f) < 7 {
+			continue
+		}
+		t := f[len(f)-6:]
+		rcvd, e1 := strconv.ParseUint(t[1], 10, 64)
+		sent, e2 := strconv.ParseUint(t[2], 10, 64)
+		outq, e3 := strconv.ParseUint(t[3], 10, 64)
+		if e1 != nil || e2 != nil || e3 != nil {
+			continue // header
+		}
+		n := BGPNeighbor{Neighbor: strings.Join(f[:len(f)-6], " "), AS: t[0], MsgRcvd: rcvd, MsgSent: sent,
+			OutQ: outq, UpDown: t[4], State: t[5]}
+		pfx, max, hasMax := strings.Cut(t[5], "/")
+		if v, err := strconv.ParseUint(pfx, 10, 64); err == nil {
+			n.Established, n.State, n.Prefixes = true, "Established", &v
+			if hasMax {
+				if m, err := strconv.ParseUint(max, 10, 64); err == nil {
+					n.MaxPrefix = &m
+				}
+			}
+		}
+		out = append(out, n)
+	}
+	return out, len(out) > 0
+}
+
+// --- ospfctl / ospf6ctl show neighbor ---
+
+// OSPFNeighbor is one row of ospfctl or ospf6ctl show neighbor.
+type OSPFNeighbor struct {
+	ID        string `json:"id"`
+	Priority  int    `json:"priority"`
+	State     string `json:"state"`           // neighbor state: FULL, 2-WAY, INIT, ...
+	Role      string `json:"interface_state"` // interface state: DR, BCKUP, OTHER, P2P, ...
+	DeadTime  string `json:"dead_time"`
+	Address   string `json:"address,omitempty"` // ospfctl only
+	Interface string `json:"interface"`
+	Uptime    string `json:"uptime,omitempty"` // empty while never up ("-")
+	Full      bool   `json:"full"`             // adjacency complete
+}
+
+var ospfIDRe = regexp.MustCompile(`^\d{1,3}(?:\.\d{1,3}){3}$`)
+
+// ParseOSPFNeighbors handles both layouts: ospfctl prints ID Pri State
+// DeadTime Address Iface Uptime, ospf6ctl the same without Address.
+func ParseOSPFNeighbors(s string) ([]OSPFNeighbor, bool) {
+	var out []OSPFNeighbor
+	for _, l := range strings.Split(s, "\n") {
+		f := strings.Fields(l)
+		if (len(f) != 6 && len(f) != 7) || !ospfIDRe.MatchString(f[0]) {
+			continue
+		}
+		pri, err := strconv.Atoi(f[1])
+		if err != nil {
+			continue
+		}
+		n := OSPFNeighbor{ID: f[0], Priority: pri, DeadTime: f[3]}
+		n.State, n.Role, _ = strings.Cut(f[2], "/")
+		rest := f[4:]
+		if len(f) == 7 {
+			n.Address, rest = f[4], f[5:]
+		}
+		n.Interface = rest[0]
+		if rest[1] != "-" {
+			n.Uptime = rest[1]
+		}
+		n.Full = n.State == "FULL"
+		out = append(out, n)
+	}
+	return out, len(out) > 0
+}
+
+// --- swapctl -l ---
+
+// SwapDevice is one row of swapctl -l; the Total row is not included.
+type SwapDevice struct {
+	Device      string `json:"device"`
+	TotalBytes  uint64 `json:"total_bytes"`
+	UsedBytes   uint64 `json:"used_bytes"`
+	AvailBytes  uint64 `json:"available_bytes"`
+	CapacityPct int    `json:"capacity_percent"`
+	Priority    int    `json:"priority"`
+}
+
+var swapHeaderRe = regexp.MustCompile(`^Device\s+(\d+)([KMG]?)-blocks\s`)
+
+func ParseSwap(s string) ([]SwapDevice, bool) {
+	var out []SwapDevice
+	var bs uint64
+	for _, l := range strings.Split(s, "\n") {
+		if m := swapHeaderRe.FindStringSubmatch(l); m != nil {
+			bs, _ = strconv.ParseUint(m[1], 10, 64)
+			bs *= map[string]uint64{"": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30}[m[2]]
+			continue
+		}
+		f := strings.Fields(l)
+		if bs == 0 || len(f) != 6 || f[0] == "Total" || !strings.HasSuffix(f[4], "%") {
+			continue
+		}
+		var n [3]uint64
+		bad := false
+		for i := range n {
+			v, err := strconv.ParseUint(f[i+1], 10, 64)
+			n[i], bad = v*bs, bad || err != nil
+		}
+		pct, e1 := strconv.Atoi(strings.TrimSuffix(f[4], "%"))
+		pri, e2 := strconv.Atoi(f[5])
+		if bad || e1 != nil || e2 != nil {
+			continue
+		}
+		out = append(out, SwapDevice{Device: f[0], TotalBytes: n[0], UsedBytes: n[1], AvailBytes: n[2],
+			CapacityPct: pct, Priority: pri})
+	}
+	return out, len(out) > 0
+}
+
+// --- key=value statistics (unbound-control stats_noreset, smtpctl show stats) ---
+
+// ParseKeyValues returns every numeric key=value line. Non-numeric values
+// (smtpctl's uptime.human) are left to the text output.
+func ParseKeyValues(s string) (map[string]float64, bool) {
+	out := map[string]float64{}
+	for _, l := range strings.Split(s, "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(l), "=")
+		if !ok || k == "" || strings.ContainsAny(k, " \t") {
+			continue
+		}
+		// NaN and Inf parse but cannot be encoded as JSON.
+		if f, err := strconv.ParseFloat(v, 64); err == nil && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			out[k] = f
+		}
+	}
+	return out, len(out) > 0
 }

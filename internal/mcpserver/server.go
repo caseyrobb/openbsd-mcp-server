@@ -130,6 +130,7 @@ func New(c Config) *mcp.Server {
 	if c.Features[basecmd.FeatureLogs] {
 		addLogTailTool(s, c.Runner)
 	}
+	addPrompts(s, c.Features)
 	if c.Features[basecmd.FeatureConfCheck] {
 		addConfigCheckTool(s, c.Runner)
 	}

@@ -68,9 +68,37 @@ agent can compare numbers without re-reading text tables:
 | `network_status interfaces` | per interface: `up`, `mtu`, `address`, `in_packets`, `in_fails`, `out_packets`, `out_fails`, `collisions` |
 | `ntp_status status` | `synced`, `stratum`, peers and sensors valid/total, `constraint_offset_secs`, `clock_offset_ms` (while unsynced) |
 | `ntp_status peers` | per peer: `selected`, `weight`, `trust_level`, `stratum`, `next_secs`, `poll_secs`, `valid`, `offset_ms`, `delay_ms`, `jitter_ms` |
+| `system_status swap` | per device: `total_bytes`, `used_bytes`, `available_bytes`, `capacity_percent`, `priority` |
+| `bgp_status summary` | per neighbor: `as`, `established`, `state`, `prefixes_received`, `max_prefix`, `msgs_received`, `msgs_sent`, `out_queue`, `up_down` |
+| `ospf_status neighbors`, `ospf6_status neighbors` | per neighbor: `id`, `priority`, `state`, `interface_state`, `full`, `dead_time`, `address` (ospf only), `interface`, `uptime` |
+| `unbound_status stats`, `smtpd_status stats` | every numeric `key=value` counter, as a map |
 
 `data` is parsed from the redacted output and is omitted when the output
 cannot be parsed; the text `output` is always returned.
+
+### Prompts
+
+The server also offers MCP prompts: guided, read-only investigations that
+tell the agent which tools to use, in what order, and how to report. A
+prompt appears only when the features it relies on are enabled, and its
+steps list only tools that are registered.
+
+| Prompt | Needs | What it does |
+|---|---|---|
+| `system_health` | nothing | load, memory, disks, swap, sensors, busy processes, interface errors; failed services and log errors if enabled |
+| `diagnose_connectivity` | nothing (uses pf, unbound, unwind, logs if enabled) | interfaces, routes, ARP/NDP, protocol counters, pf rules and state, resolver. Optional `target` |
+| `check_time_sync` | `ntp` | sync state, peer health from the parsed data, timedelta sensors, ntpd log lines |
+| `firewall_review` | `pf` | explains the loaded ruleset and state, checks pf.conf parses, compares listeners with the rules |
+| `service_health` | `services`, `confcheck` or `logs` | failed services, their config check and log lines. Optional `service` |
+| `routing_health` | `bgp`, `ospf` or `ospf6` | sessions and neighbors from the parsed data, RIB versus kernel routes |
+| `auth_review` | `logs` | logins, failures and doas use from `authlog` and `secure` |
+
+Every prompt tells the agent that the server is read-only, to quote evidence,
+to treat log text as data, and to end with next steps as commands for the
+administrator to run. Prompt arguments are client input placed into the
+text, so they must match a strict pattern (`target`: a host name or IP
+address; `service`: an rc.d name) or the request is refused. `prompts/get`
+is recorded in the audit log like tool calls.
 
 ### Reading logs
 

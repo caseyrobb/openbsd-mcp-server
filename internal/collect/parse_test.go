@@ -260,3 +260,145 @@ func TestParsersOnlyForRegisteredViews(t *testing.T) {
 		}
 	}
 }
+
+// bgpSummarySample follows bgpctl output.c show_summary_head/show_summary.
+func bgpSummarySample() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-28s %-10s %10s %10s %5s %-8s %s\n", "Neighbor", "AS", "MsgRcvd", "MsgSent", "OutQ", "Up/Down", "State/PrfRcvd")
+	row := func(name, as string, rcvd, sent, q int, updown, state string) {
+		fmt.Fprintf(&b, "%-*s %s %10d %10d %5d %-8s %s\n", 28-len(as), name, as, rcvd, sent, q, updown, state)
+	}
+	row("upstream one", "65001", 1234, 1200, 0, "1d02h03m", "  1520")
+	row("192.0.2.2", "65002", 5, 6, 0, "Never", "Active")
+	row("peer-with-max", "4200000000", 10, 10, 2, "00:12:34", "    12/100")
+	row("rs template", "65003", 0, 0, 0, "Never", "Template")
+	return b.String()
+}
+
+func TestParseBGPSummary(t *testing.T) {
+	got, ok := ParseBGPSummary(bgpSummarySample())
+	if !ok || len(got) != 4 {
+		t.Fatalf("got %+v", got)
+	}
+	if n := got[0]; n.Neighbor != "upstream one" || n.AS != "65001" || n.MsgRcvd != 1234 || n.MsgSent != 1200 ||
+		n.UpDown != "1d02h03m" || !n.Established || n.State != "Established" || *n.Prefixes != 1520 || n.MaxPrefix != nil {
+		t.Errorf("established: %+v", n)
+	}
+	if n := got[1]; n.Established || n.State != "Active" || n.Prefixes != nil || n.UpDown != "Never" {
+		t.Errorf("active: %+v", n)
+	}
+	if n := got[2]; n.AS != "4200000000" || n.OutQ != 2 || *n.Prefixes != 12 || *n.MaxPrefix != 100 {
+		t.Errorf("max prefix: %+v", n)
+	}
+	if n := got[3]; n.Neighbor != "rs template" || n.State != "Template" || n.Established {
+		t.Errorf("template: %+v", n)
+	}
+}
+
+// ospfNbrSample follows ospfctl output.c show_neighbor (with Address) or
+// ospf6ctl.c show_nbr_msg (without).
+func ospfNbrSample(v6 bool) string {
+	var b strings.Builder
+	if v6 {
+		fmt.Fprintf(&b, "%-15s %-3s %-12s %-9s %-11s %s\n", "ID", "Pri", "State", "DeadTime", "Iface", "Uptime")
+		fmt.Fprintf(&b, "%-15s %-3d %-12s %-10s", "10.0.0.2", 1, "FULL/DR", "00:00:35")
+		fmt.Fprintf(&b, "%-11s %s\n", "vio0", "01:02:03")
+		fmt.Fprintf(&b, "%-15s %-3d %-12s %-10s", "10.0.0.3", 0, "2-WAY/OTHER", "00:00:31")
+		fmt.Fprintf(&b, "%-11s %s\n", "vio1", "-")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%-15s %-3s %-12s %-8s %-15s %-9s %s\n", "ID", "Pri", "State", "DeadTime", "Address", "Iface", "Uptime")
+	fmt.Fprintf(&b, "%-15s %-3d %-12s %-9s", "10.0.0.2", 1, "FULL/DR", "00:00:35")
+	fmt.Fprintf(&b, "%-15s %-9s %s\n", "192.0.2.2", "vio0", "1d02h03m")
+	fmt.Fprintf(&b, "%-15s %-3d %-12s %-9s", "10.0.0.3", 1, "INIT/BCKUP", "00:00:39")
+	fmt.Fprintf(&b, "%-15s %-9s %s\n", "192.0.2.3", "vio0", "-")
+	return b.String()
+}
+
+func TestParseOSPFNeighbors(t *testing.T) {
+	got, ok := ParseOSPFNeighbors(ospfNbrSample(false))
+	if !ok || len(got) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+	if n := got[0]; n.ID != "10.0.0.2" || n.Priority != 1 || n.State != "FULL" || n.Role != "DR" || !n.Full ||
+		n.DeadTime != "00:00:35" || n.Address != "192.0.2.2" || n.Interface != "vio0" || n.Uptime != "1d02h03m" {
+		t.Errorf("v4 full: %+v", n)
+	}
+	if n := got[1]; n.State != "INIT" || n.Full || n.Uptime != "" {
+		t.Errorf("v4 init: %+v", n)
+	}
+	got, ok = ParseOSPFNeighbors(ospfNbrSample(true))
+	if !ok || len(got) != 2 {
+		t.Fatalf("v6 got %+v", got)
+	}
+	if n := got[0]; n.Address != "" || n.Interface != "vio0" || n.Uptime != "01:02:03" || !n.Full {
+		t.Errorf("v6 full: %+v", n)
+	}
+	if n := got[1]; n.State != "2-WAY" || n.Role != "OTHER" || n.Priority != 0 || n.Interface != "vio1" || n.Uptime != "" {
+		t.Errorf("v6 2-way: %+v", n)
+	}
+}
+
+// swapSample follows swapctl swaplist.c list_swap with dolong.
+func swapSample(devs int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%-*s %*s %8s %8s %8s  %s\n", 11, "Device", 10, "512-blocks", "Used", "Avail", "Capacity", "Priority")
+	fmt.Fprintf(&b, "%-*s %*d ", 11, "/dev/sd0b", 10, 4194304)
+	fmt.Fprintf(&b, "%8d %8d %5.0f%%    %d\n", 1024, 4193280, 0.02, 0)
+	if devs > 1 {
+		fmt.Fprintf(&b, "%-*s %*d ", 11, "/dev/sd1b", 10, 2097152)
+		fmt.Fprintf(&b, "%8d %8d %5.0f%%    %d\n", 1048576, 1048576, 50.0, 1)
+		fmt.Fprintf(&b, "%-*s %*d %8d %8d %5.0f%%\n", 11, "Total", 10, 6291456, 1049600, 5241856, 17.0)
+	}
+	return b.String()
+}
+
+func TestParseSwap(t *testing.T) {
+	got, ok := ParseSwap(swapSample(2))
+	if !ok || len(got) != 2 {
+		t.Fatalf("got %+v", got)
+	}
+	if d := got[0]; d.Device != "/dev/sd0b" || d.TotalBytes != 4194304*512 || d.UsedBytes != 1024*512 ||
+		d.AvailBytes != 4193280*512 || d.CapacityPct != 0 || d.Priority != 0 {
+		t.Errorf("sd0b: %+v", d)
+	}
+	if d := got[1]; d.CapacityPct != 50 || d.Priority != 1 {
+		t.Errorf("sd1b: %+v", d)
+	}
+	if _, ok := ParseSwap("No swap devices configured\n"); ok {
+		t.Error("parsed no-swap message")
+	}
+	k := strings.Replace(swapSample(1), "512-blocks", " 1K-blocks", 1)
+	if got, ok := ParseSwap(k); !ok || got[0].TotalBytes != 4194304*1024 {
+		t.Errorf("1K blocks: %+v", got)
+	}
+}
+
+func TestParseKeyValues(t *testing.T) {
+	got, ok := ParseKeyValues("total.num.queries=1234\ntime.up=86400.123456\nuptime.human=1d\nnum.answer.rcode.NOERROR=7\n" +
+		"bad key=1\n=3\nx=NaN\ny=+Inf\nnot a stat line\n")
+	if !ok || len(got) != 3 || got["total.num.queries"] != 1234 || got["time.up"] != 86400.123456 ||
+		got["num.answer.rcode.NOERROR"] != 7 {
+		t.Errorf("got %v", got)
+	}
+	if _, err := json.Marshal(got); err != nil {
+		t.Errorf("not JSON-encodable: %v", err)
+	}
+}
+
+// Every parser must survive arbitrary text and return JSON-encodable data:
+// a parser panic or an unencodable value would turn a working view into a
+// tool error.
+func FuzzParsers(f *testing.F) {
+	for _, s := range []string{pfInfoSample(), sensorsSample, netstatSample(), ntpPeersSample(), bgpSummarySample(),
+		ospfNbrSample(false), ospfNbrSample(true), swapSample(2), "a=1\nb=NaN\n", "hw.sensors.x0.temp0=NaN degC\nhw.sensors.x0.raw0=-Inf\n", ""} {
+		f.Add(s)
+	}
+	f.Fuzz(func(t *testing.T, s string) {
+		for id, p := range parsers {
+			if _, err := json.Marshal(p(s)); err != nil {
+				t.Errorf("%s: %v", id, err)
+			}
+		}
+	})
+}

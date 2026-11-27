@@ -1,0 +1,8 @@
+Neighbor                   AS    MsgRcvd    MsgSent  OutQ Up/Down  State/PrfRcvd
+192.0.2.2          4200000001          0          0     0 2d03h22m Active
+2001:db8:abcd::2   4200000001          0          0     0 2d03h22m Active
+192.0.2.3          4200000001          0          0     0 2d03h22m Active
+2001:db8:abcd::3   4200000001          0          0     0 2d03h22m Active
+upstream1               65002          0          0     0 2d03h22m Connect
+upstream2-4             65123          0          0     0 2d03h22m Connect
+upstream2-6             65123          0          0     0 2d03h22m Active

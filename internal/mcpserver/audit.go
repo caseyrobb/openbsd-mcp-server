@@ -14,7 +14,7 @@ import (
 	"github.com/caseyrobb/openbsd-mcp-server/internal/audit"
 )
 
-// auditMiddleware logs every initialize and tools/call, including calls the
+// auditMiddleware logs every initialize, tools/call and prompts/get, including calls the
 // SDK rejects before a handler runs (unknown tool, schema violation). It
 // records what was asked and how it ended, never the tool output.
 //
@@ -24,16 +24,19 @@ func auditMiddleware(l audit.Logger) mcp.Middleware {
 	return func(next mcp.MethodHandler) mcp.MethodHandler {
 		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
 			switch method {
-			case "initialize", "tools/call":
+			case "initialize", "tools/call", "prompts/get":
 			default:
 				return next(ctx, method, req)
 			}
 			start := time.Now()
 			res, err := next(ctx, method, req)
 			ms := time.Since(start).Milliseconds()
-			if method == "initialize" {
+			switch method {
+			case "initialize":
 				logInitialize(l, req, err)
-			} else {
+			case "prompts/get":
+				logPromptGet(l, req, err)
+			default:
 				logToolCall(l, req, res, err, ms)
 			}
 			return res, err
@@ -56,6 +59,20 @@ func logInitialize(l audit.Logger, req mcp.Request, err error) {
 		return
 	}
 	l.Log(audit.Info, msg)
+}
+
+func logPromptGet(l audit.Logger, req mcp.Request, err error) {
+	msg := "event=prompt_get"
+	if p, ok := req.GetParams().(*mcp.GetPromptParams); ok && p != nil {
+		raw, _ := json.Marshal(p.Arguments)
+		msg += " prompt=" + audit.Sanitize(p.Name, 64) + " args=" + formatArgs(raw)
+	}
+	msg += " client=" + clientName(req)
+	if err != nil {
+		l.Log(audit.Notice, msg+" result=error error="+audit.Sanitize(err.Error(), 200))
+		return
+	}
+	l.Log(audit.Info, msg+" result=ok")
 }
 
 func logToolCall(l audit.Logger, req mcp.Request, res mcp.Result, err error, ms int64) {
