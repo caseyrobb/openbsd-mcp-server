@@ -1,0 +1,12 @@
+peer
+   wt tl st  next  poll          offset       delay      jitter
+162.159.200.123 time.cloudflare.com
+    1 10  3  788s 1608s         0.706ms    21.261ms     2.233ms
+162.159.200.1 from pool pool.ntp.org
+ *  1 10  3  849s 1522s        24.500ms    69.100ms   143.992ms
+198.181.199.84 from pool pool.ntp.org
+    1 10  1  423s 1483s        -0.499ms    52.988ms     4.186ms
+173.206.125.128 from pool pool.ntp.org
+    1 10  1  726s 1524s         0.788ms    55.419ms     2.561ms
+206.248.144.166 from pool pool.ntp.org
+    1 10  1  629s 1607s        -0.103ms    57.247ms     3.111ms

@@ -263,7 +263,7 @@ func probeFeatures(en basecmd.Enabled) int {
 	if en[basecmd.FeatureLogs] {
 		for _, l := range collect.Logs {
 			step("log_tail %s", l.Name)
-			res, err := collect.LogTail(context.Background(), r, l.Name, 5, "")
+			res, err := collect.LogTail(context.Background(), r, l.Name, collect.MaxLogLines, "")
 			switch {
 			case err != nil && strings.Contains(err.Error(), "No such file or directory"):
 				fmt.Printf("note: log_tail %s: absent\n", l.Name)

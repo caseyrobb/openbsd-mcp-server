@@ -1,0 +1,26 @@
+Status: Enabled for 2 days 13:15:30              Debug: err
+
+State Table                          Total             Rate
+  current entries                       29               
+  half-open tcp                          0               
+  searches                          947972            4.3/s
+  inserts                            95836            0.4/s
+  removals                           95807            0.4/s
+Counters
+  match                              96072            0.4/s
+  bad-offset                             0            0.0/s
+  fragment                               0            0.0/s
+  short                                 10            0.0/s
+  normalize                              0            0.0/s
+  memory                                 0            0.0/s
+  bad-timestamp                          0            0.0/s
+  congestion                             0            0.0/s
+  ip-option                              0            0.0/s
+  proto-cksum                            0            0.0/s
+  state-mismatch                         0            0.0/s
+  state-insert                           0            0.0/s
+  state-limit                            0            0.0/s
+  src-limit                              0            0.0/s
+  synproxy                               0            0.0/s
+  translate                              0            0.0/s
+  no-route                               0            0.0/s

@@ -90,6 +90,9 @@ func TestAuthLine(t *testing.T) {
 			"sshd[1]: Disconnected from invalid user <redacted> 2001:db8::1 port 22 [preauth]"},
 		{"sshd[1]: input_userauth_request: invalid user x y [preauth]",
 			"sshd[1]: input_userauth_request: invalid user <redacted> [preauth]"},
+		// OpenBSD 8.0 sshd-session, as seen on a real host.
+		{"testbsd sshd-session[20040]: Connection closed by invalid user jdoe 192.0.2.88 port 37760 [preauth]",
+			"testbsd sshd-session[20040]: Connection closed by invalid user <redacted> 192.0.2.88 port 37760 [preauth]"},
 		{"sshd[1]: Accepted publickey for jdoe from 192.0.2.7 port 22 ssh2",
 			"sshd[1]: Accepted publickey for jdoe from 192.0.2.7 port 22 ssh2"},
 		{"doas: jdoe ran command mysql -u root -pS3CR3T as root from /home/jdoe",
